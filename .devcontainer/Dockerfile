@@ -26,6 +26,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   nano \
   vim \
   lua5.3 \
+  python3-pip \
+  python3-venv \
   && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Ensure default node user has access to /usr/local/share
