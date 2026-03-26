@@ -601,9 +601,8 @@ def export_mod():
     refs_data = build_refs(data)
 
     # Clean and recreate export dir
-    export_root = DATA_DIR / "export"
-    if export_root.exists():
-        shutil.rmtree(export_root)
+    if EXPORT_DIR.exists():
+        shutil.rmtree(EXPORT_DIR)
 
     audio_dir = EXPORT_DIR / "audio"
     audio_dir.mkdir(parents=True)
