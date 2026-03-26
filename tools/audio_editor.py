@@ -734,6 +734,48 @@ def _audio_rms(filepath):
     return None
 
 
+def _wav_peak(filepath):
+    """Return the peak amplitude (0.0-1.0) of a WAV file."""
+    import struct, wave
+    try:
+        with wave.open(str(filepath), "rb") as w:
+            n = w.getnframes()
+            if n == 0:
+                return None
+            sw = w.getsampwidth()
+            raw = w.readframes(n)
+            ch = w.getnchannels()
+            total = n * ch
+            if sw == 2:
+                samples = struct.unpack(f"<{total}h", raw)
+                peak = max(abs(s) for s in samples) / 32768.0
+            elif sw == 3:
+                samples = []
+                for i in range(0, len(raw), 3):
+                    val = int.from_bytes(raw[i:i+3], "little", signed=True)
+                    samples.append(val)
+                peak = max(abs(s) for s in samples) / 8388608.0
+            elif sw == 1:
+                samples = struct.unpack(f"{total}B", raw)
+                peak = max(abs(s - 128) for s in samples) / 128.0
+            else:
+                return None
+            return peak if peak > 0 else None
+    except Exception:
+        return None
+
+
+def _normalize_peak_wav(filepath, target_peak=0.95):
+    """Normalize a WAV file so its peak hits target_peak (default -0.4dB)."""
+    peak = _wav_peak(filepath)
+    if peak and peak > 0:
+        gain = target_peak / peak
+        if gain > 1.05:  # only boost, don't attenuate
+            _apply_gain_wav(filepath, gain)
+            return True
+    return False
+
+
 def _apply_gain_wav(filepath, gain):
     """Apply a linear gain factor to a WAV file in-place."""
     import struct, tempfile, wave
@@ -840,18 +882,32 @@ def export_mod():
                 convert_failures.append(custom_name)
                 continue
 
-        # Volume equalization: match replacement loudness to original
-        original_path = AUDIO_DIR / original
-        if original_path.exists():
-            orig_rms = _audio_rms(original_path)
-            repl_rms = _wav_rms(dst)
-            if orig_rms and repl_rms:
-                gain = orig_rms / repl_rms
-                if abs(gain - 1.0) > 0.05:  # only adjust if >5% difference
-                    _apply_gain_wav(dst, gain)
-                    equalized += 1
-
         clip_refs = refs_data.get(original, [])
+
+        # Determine if this is a weapon or voice clip from references
+        is_weapon = any(r.get("action", "").startswith("fire") or
+                        r.get("action", "").startswith("reload") or
+                        r.get("action", "").startswith("chamber") or
+                        r.get("action", "").startswith("bolt") or
+                        not r.get("entity", "").startswith("Voice")
+                        for r in clip_refs) if clip_refs else True
+
+        if is_weapon:
+            # Weapons: peak normalize to -0.4dB for maximum punch
+            if _normalize_peak_wav(dst):
+                equalized += 1
+        else:
+            # Voices: RMS match to original for natural blending
+            original_path = AUDIO_DIR / original
+            if original_path.exists():
+                orig_rms = _audio_rms(original_path)
+                repl_rms = _wav_rms(dst)
+                if orig_rms and repl_rms:
+                    gain = orig_rms / repl_rms
+                    if abs(gain - 1.0) > 0.05:
+                        _apply_gain_wav(dst, gain)
+                        equalized += 1
+
         manifest[original] = {
             "replacement": export_name,
             "references": clip_refs,
@@ -1396,6 +1452,10 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
             self._send_json(self._handle_revert(body))
+        elif path == "/api/swap/bulk-voice":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            self._send_json(self._handle_bulk_voice(body))
         elif path == "/api/export":
             self._send_json(export_mod())
         elif path == "/api/profile/save":
@@ -1526,6 +1586,41 @@ class Handler(BaseHTTPRequestHandler):
                 custom_path.unlink()
 
         return {"ok": True}
+
+    def _handle_bulk_voice(self, body):
+        """Bulk-assign an RO2 voice actor to an ER2 voice entity."""
+        import shutil
+        entity = body.get("entity")         # ER2 entity, e.g. "Voice-ger-1"
+        game = body.get("game")             # "RO2" or "RS"
+        actor = body.get("actor")           # RO2 voice ID, e.g. "GerNative_01"
+        assignments = body.get("assignments")  # [{original, ro2_path}, ...]
+
+        if not entity or not assignments:
+            return {"ok": False, "error": "Missing entity or assignments"}
+
+        CUSTOM_DIR.mkdir(parents=True, exist_ok=True)
+        swaps = load_swaps()
+        sources = load_swap_sources()
+        assigned = 0
+
+        for a in assignments:
+            original = a.get("original")
+            ro2_path = a.get("ro2_path")
+            if not original or not ro2_path:
+                continue
+            src = RO2_DIR / ro2_path
+            if not src.exists():
+                continue
+
+            custom_name = Path(original).stem + "_ro2" + src.suffix
+            shutil.copy2(src, CUSTOM_DIR / custom_name)
+            swaps[original] = custom_name
+            sources[original] = ro2_path
+            assigned += 1
+
+        save_swaps(swaps)
+        save_swap_sources(sources)
+        return {"ok": True, "assigned": assigned}
 
     def _serve_file(self, filepath):
         mime = mimetypes.guess_type(str(filepath))[0] or "application/octet-stream"
@@ -2055,7 +2150,13 @@ function renderEntity(entity) {
   var filterEl = document.getElementById('clip-filter');
   var filter = filterEl ? filterEl.value.toLowerCase() : '';
   var sorted = Object.keys(actions).sort();
-  var html = '<div id="entity-title">' + esc(entity) + '</div>';
+  var html = '<div id="entity-title">' + esc(entity);
+  if (entityCategory(entity) === 0) {
+    html += ' <button onclick="showAssignVoice(\'' + escAttr(entity) + '\')" ' +
+      'style="font-size:12px;padding:4px 12px;margin-left:12px;background:#0f3460;border:none;' +
+      'color:#e0e0e0;border-radius:4px;cursor:pointer;vertical-align:middle;">Assign RO2 Voice</button>';
+  }
+  html += '</div>';
 
   for (var i = 0; i < sorted.length; i++) {
     var action = sorted[i];
@@ -2112,6 +2213,186 @@ function renderEntity(entity) {
 
 function closeModal() {
   document.getElementById('modal-root').innerHTML = '';
+}
+
+function matchRO2Action(er2Action) {
+  var kw = ACTION_KEYWORDS[er2Action] || '';
+  var terms = tokenize(er2Action + ' ' + kw);
+  return terms;
+}
+
+function findBestRO2Clips(actor, er2Action, er2ClipCount) {
+  // actor: {actions: {ro2Action: [paths]}, ...}
+  var terms = matchRO2Action(er2Action);
+  if (!terms.length) return [];
+
+  var best = null;
+  var bestScore = 0;
+  for (var ro2Action in actor.actions) {
+    var ro2Tokens = tokenize(ro2Action);
+    var score = 0;
+    for (var i = 0; i < terms.length; i++) {
+      for (var j = 0; j < ro2Tokens.length; j++) {
+        if (ro2Tokens[j].indexOf(terms[i]) !== -1 || terms[i].indexOf(ro2Tokens[j]) !== -1) {
+          score += 10;
+        }
+      }
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      best = actor.actions[ro2Action];
+    }
+  }
+  return best || [];
+}
+
+function showAssignVoice(entity) {
+  var actors = getRO2VoiceActors();
+  var root = document.getElementById('modal-root');
+  var html = '<div class="modal-bg" onclick="if(event.target===this)closeModal()">' +
+    '<div class="modal" style="max-width:700px;">' +
+    '<h3>Assign RO2 Voice to ' + esc(entity) + '</h3>' +
+    '<p style="font-size:12px;color:#888;margin-bottom:12px;">Select an RO2 voice actor to auto-match clips by action type.</p>' +
+    '<select id="bulk-voice-select" onchange="previewBulkAssign(\'' + escAttr(entity) + '\')" ' +
+    'style="width:100%;background:#1a1a2e;border:1px solid #0f3460;color:#e0e0e0;' +
+    'padding:8px 10px;border-radius:4px;font-size:13px;margin-bottom:12px;">' +
+    '<option value="">Select voice actor...</option>';
+  for (var i = 0; i < actors.length; i++) {
+    html += '<option value="' + escAttr(actors[i].key) + '">' + esc(actors[i].label) + '</option>';
+  }
+  html += '</select>' +
+    '<div id="bulk-preview" style="max-height:400px;overflow-y:auto;margin-bottom:12px;"></div>' +
+    '<div class="btn-row">' +
+    '<button class="btn-cancel" onclick="closeModal()">Cancel</button>' +
+    '<button class="btn-ok" id="bulk-assign-btn" onclick="doBulkAssign(\'' + escAttr(entity) + '\')" disabled>Assign</button>' +
+    '</div></div></div>';
+  root.innerHTML = html;
+}
+
+var _bulkAssignments = [];
+
+function previewBulkAssign(entity) {
+  var sel = document.getElementById('bulk-voice-select').value;
+  var preview = document.getElementById('bulk-preview');
+  var btn = document.getElementById('bulk-assign-btn');
+  _bulkAssignments = [];
+
+  if (!sel) {
+    preview.innerHTML = '';
+    btn.disabled = true;
+    return;
+  }
+
+  var parts = sel.split('/');
+  var game = parts[0];
+  var actorId = parts[1];
+  var actor = (ro2[game] || {}).voices ? ro2[game].voices[actorId] : null;
+  if (!actor) {
+    preview.innerHTML = '<p style="color:#e94560;">Voice actor not found.</p>';
+    btn.disabled = true;
+    return;
+  }
+
+  var er2Actions = data.voices[entity];
+  var html = '<table style="width:100%;font-size:12px;border-collapse:collapse;">' +
+    '<tr style="color:#888;text-align:left;border-bottom:1px solid #0f3460;">' +
+    '<th style="padding:4px 8px;">ER2 Action</th>' +
+    '<th style="padding:4px 8px;">Clips</th>' +
+    '<th style="padding:4px 8px;">RO2 Match</th>' +
+    '<th style="padding:4px 8px;">Available</th>' +
+    '<th style="padding:4px 8px;width:30px;"></th></tr>';
+
+  var sortedActions = Object.keys(er2Actions).sort();
+  for (var i = 0; i < sortedActions.length; i++) {
+    var action = sortedActions[i];
+    var er2Clips = er2Actions[action];
+    var ro2Clips = findBestRO2Clips(actor, action, er2Clips.length);
+    var matched = Math.min(er2Clips.length, ro2Clips.length);
+    var hasMatch = matched > 0;
+    var rowStyle = hasMatch ? 'color:#e0e0e0;' : 'color:#555;';
+
+    // Find which RO2 action matched for display
+    var ro2ActionName = '';
+    if (hasMatch) {
+      for (var ra in actor.actions) {
+        for (var ri = 0; ri < actor.actions[ra].length; ri++) {
+          if (actor.actions[ra][ri] === ro2Clips[0]) { ro2ActionName = ra; break; }
+        }
+        if (ro2ActionName) break;
+      }
+    }
+
+    var checkId = 'bulk-check-' + i;
+    html += '<tr style="' + rowStyle + 'border-bottom:1px solid #0f3460;">' +
+      '<td style="padding:4px 8px;">' + esc(action) + '</td>' +
+      '<td style="padding:4px 8px;">' + er2Clips.length + '</td>' +
+      '<td style="padding:4px 8px;">' + (ro2ActionName ? esc(ro2ActionName.split('_').pop()) : '<span style="color:#555;">none</span>') + '</td>' +
+      '<td style="padding:4px 8px;">' + (hasMatch ? matched + '/' + ro2Clips.length : '-') + '</td>' +
+      '<td style="padding:4px 8px;"><input type="checkbox" id="' + checkId + '" ' +
+      (hasMatch ? 'checked' : 'disabled') + ' data-action="' + escAttr(action) + '"></td></tr>';
+
+    if (hasMatch) {
+      for (var m = 0; m < matched; m++) {
+        _bulkAssignments.push({
+          action: action,
+          original: er2Clips[m],
+          ro2_path: ro2Clips[m],
+          checkIndex: i,
+        });
+      }
+    }
+  }
+  html += '</table>';
+  preview.innerHTML = html;
+  btn.disabled = _bulkAssignments.length === 0;
+}
+
+async function doBulkAssign(entity) {
+  var sel = document.getElementById('bulk-voice-select').value;
+  var parts = sel.split('/');
+
+  // Filter by checked actions
+  var checked = {};
+  var checkboxes = document.querySelectorAll('[id^="bulk-check-"]');
+  for (var i = 0; i < checkboxes.length; i++) {
+    if (checkboxes[i].checked) {
+      checked[checkboxes[i].getAttribute('data-action')] = true;
+    }
+  }
+  var assignments = _bulkAssignments.filter(function(a) { return checked[a.action]; });
+  if (!assignments.length) return;
+
+  var root = document.getElementById('modal-root');
+  root.innerHTML = '<div class="modal-bg">' +
+    '<div class="modal" style="text-align:center;padding:40px;">' +
+    '<h3>Assigning...</h3>' +
+    '<p style="color:#888;margin-top:12px;">' + assignments.length + ' clips</p>' +
+    '</div></div>';
+
+  var res = await fetch('/api/swap/bulk-voice', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      entity: entity,
+      game: parts[0],
+      actor: parts[1],
+      assignments: assignments.map(function(a) {
+        return { original: a.original, ro2_path: a.ro2_path };
+      }),
+    }),
+  });
+  var result = await res.json();
+  closeModal();
+  if (result.ok) {
+    var root2 = document.getElementById('modal-root');
+    root2.innerHTML = '<div class="modal-bg" onclick="if(event.target===this)closeModal()">' +
+      '<div class="modal">' +
+      '<h3>Voice Assigned</h3>' +
+      '<p style="margin-bottom:12px;">' + result.assigned + ' clips assigned from ' + esc(parts[1]) + '.</p>' +
+      '<div class="btn-row"><button class="btn-ok" onclick="closeModal()">OK</button></div>' +
+      '</div></div>';
+  }
+  await reloadAll();
 }
 
 function showRefs(clip) {
@@ -2177,25 +2458,72 @@ function getRO2VoiceActors() {
   return sorted.map(function(k) { return { key: k, label: actors[k] }; });
 }
 
+function getRO2Filters() {
+  var categories = {};
+  var entities = {};
+  for (var i = 0; i < ro2Index.length; i++) {
+    var item = ro2Index[i];
+    var catKey = item.game + '/' + item.category;
+    categories[catKey] = item.game + ' \u00b7 ' + item.category;
+    var entKey = item.game + '/' + item.category + '/' + item.entity;
+    var entLabel = item.entity;
+    if (item.category === 'voice' && item.faction) entLabel += ' (' + item.faction + ')';
+    entities[entKey] = { label: entLabel, cat: catKey };
+  }
+  return { categories: categories, entities: entities };
+}
+
+function updateRO2EntityFilter() {
+  var catSel = document.getElementById('ro2-cat-filter');
+  var entSel = document.getElementById('ro2-ent-filter');
+  var catVal = catSel ? catSel.value : '';
+  var filters = getRO2Filters();
+
+  var html = '<option value="">All</option>';
+  var keys = Object.keys(filters.entities).sort();
+  for (var i = 0; i < keys.length; i++) {
+    var ent = filters.entities[keys[i]];
+    if (catVal && ent.cat !== catVal) continue;
+    html += '<option value="' + escAttr(keys[i]) + '">' + esc(ent.label) + '</option>';
+  }
+  entSel.innerHTML = html;
+  renderRO2Results();
+}
+
 function swapTabRO2() {
   var tabs = document.querySelectorAll('.ro2-tabs button');
   tabs[0].className = 'active'; tabs[1].className = '';
   var sc = document.getElementById('swap-content');
-  var actors = getRO2VoiceActors();
-  var filterHtml = '<select id="ro2-voice-filter" onchange="renderRO2Results()" ' +
+  var filters = getRO2Filters();
+
+  var catHtml = '<select id="ro2-cat-filter" onchange="updateRO2EntityFilter()" ' +
+    'style="background:#1a1a2e;border:1px solid #0f3460;color:#e0e0e0;padding:6px 10px;' +
+    'border-radius:4px;font-size:12px;min-width:0;">' +
+    '<option value="">All categories</option>';
+  var catKeys = Object.keys(filters.categories).sort();
+  for (var i = 0; i < catKeys.length; i++) {
+    catHtml += '<option value="' + escAttr(catKeys[i]) + '">' + esc(filters.categories[catKeys[i]]) + '</option>';
+  }
+  catHtml += '</select>';
+
+  var entHtml = '<select id="ro2-ent-filter" onchange="renderRO2Results()" ' +
     'style="background:#1a1a2e;border:1px solid #0f3460;color:#e0e0e0;padding:6px 10px;' +
     'border-radius:4px;font-size:12px;flex:1;min-width:0;">' +
-    '<option value="">All voice actors</option>';
-  for (var i = 0; i < actors.length; i++) {
-    filterHtml += '<option value="' + escAttr(actors[i].key) + '">' + esc(actors[i].label) + '</option>';
+    '<option value="">All</option>';
+  var entKeys = Object.keys(filters.entities).sort();
+  for (var i = 0; i < entKeys.length; i++) {
+    entHtml += '<option value="' + escAttr(entKeys[i]) + '">' + esc(filters.entities[entKeys[i]].label) + '</option>';
   }
-  filterHtml += '</select>';
+  entHtml += '</select>';
+
   sc.innerHTML =
     '<div style="display:flex;gap:6px;margin-bottom:4px;">' +
     '<input type="text" id="ro2-search" placeholder="Search RO2 clips..." ' +
     'oninput="renderRO2Results()" style="flex:1;background:#1a1a2e;border:1px solid #0f3460;' +
     'color:#e0e0e0;padding:6px 10px;border-radius:4px;font-size:12px;">' +
-    filterHtml + '</div>' +
+    '</div>' +
+    '<div style="display:flex;gap:6px;margin-bottom:4px;">' +
+    catHtml + entHtml + '</div>' +
     '<div class="ro2-results" id="ro2-results"></div>';
   renderRO2Results();
 }
@@ -2223,17 +2551,21 @@ function swapTabFile() {
 function renderRO2Results() {
   var query = (document.getElementById('ro2-search') || {}).value || '';
   var queryTokens = tokenize(query);
-  var voiceFilter = (document.getElementById('ro2-voice-filter') || {}).value || '';
+  var catFilter = (document.getElementById('ro2-cat-filter') || {}).value || '';
+  var entFilter = (document.getElementById('ro2-ent-filter') || {}).value || '';
   var entity = _swapCtx.entity;
   var action = _swapCtx.action;
   var original = _swapCtx.original;
+  var hasFilter = catFilter || entFilter;
 
   // Score and sort
   var scored = [];
   for (var i = 0; i < ro2Index.length; i++) {
     var item = ro2Index[i];
-    // Apply voice actor filter
-    if (voiceFilter && (item.category !== 'voice' || (item.game + '/' + item.entity) !== voiceFilter)) continue;
+    // Apply category filter
+    if (catFilter && (item.game + '/' + item.category) !== catFilter) continue;
+    // Apply entity filter
+    if (entFilter && (item.game + '/' + item.category + '/' + item.entity) !== entFilter) continue;
     var s = scoreRO2(item, entity, action, original);
     // Apply search filter
     if (queryTokens.length > 0) {
@@ -2246,7 +2578,7 @@ function renderRO2Results() {
       if (matched === 0) continue;
       s += matched * 15;
     }
-    if (s > 0 || queryTokens.length > 0 || voiceFilter) scored.push({ item: item, score: s });
+    if (s > 0 || queryTokens.length > 0 || hasFilter) scored.push({ item: item, score: s });
   }
 
   scored.sort(function(a, b) { return b.score - a.score; });
