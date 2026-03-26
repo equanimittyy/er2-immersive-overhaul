@@ -1,14 +1,16 @@
 # Extracted game assets (large binary files, not suitable for git)
 data/
 
-# Mod export output (except plugin source)
-export/
-!export/ER2AudioMod/src/
-!export/ER2AudioMod/src/**
+# Mod export output
+export/ER2AudioMod/audio/
+export/ER2AudioMod/*.dll
+export/ER2AudioMod/*.json
 
 # Python
 .venv/
 __pycache__/
 *.pyc
 
-src/
+# C# build artifacts (not plugin source)
+export/ER2AudioMod/src/obj/
+export/ER2AudioMod/src/bin/
