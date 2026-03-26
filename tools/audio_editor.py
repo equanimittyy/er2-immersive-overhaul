@@ -23,8 +23,41 @@ RO2_DIR = DATA_DIR / "RO2-RS"
 MAPPING_FILE = DATA_DIR / "audio_mapping.json"
 RO2_CATALOGUE_FILE = DATA_DIR / "ro2_catalogue.json"
 SWAPS_FILE = DATA_DIR / "swaps.json"
+CONFIG_FILE = DATA_DIR / "config.json"
 PORT = 8420
 _audio_info_cache = {}  # populated at startup
+
+
+def load_config():
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def save_config(config):
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=2)
+
+
+def get_game_path():
+    return load_config().get("game_path", "")
+
+
+def validate_game_path(path):
+    """Check if a path looks like a valid ER2 install with BepInEx."""
+    p = Path(path)
+    issues = []
+    if not p.exists():
+        return False, ["Path does not exist"]
+    if not (p / "Easy Red 2_Data").exists():
+        issues.append("Easy Red 2_Data folder not found")
+    if not (p / "BepInEx" / "core").exists():
+        issues.append("BepInEx not installed (BepInEx/core/ missing)")
+    if not (p / "BepInEx" / "interop" / "Assembly-CSharp.dll").exists():
+        issues.append("BepInEx interop DLLs missing — launch the game once with BepInEx installed")
+    return len(issues) == 0, issues
 
 # GenericGun audio fields
 WEAPON_AUDIO_FIELDS = {
@@ -743,28 +776,34 @@ namespace ER2AudioMod
 }
 '''
 
-    csproj = r'''<Project Sdk="Microsoft.NET.Sdk">
+    game_path = get_game_path().replace("/", "\\")
+    if not game_path:
+        game_path = "C:\\SET_YOUR_GAME_PATH"
+
+    csproj = f'''<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net6.0</TargetFramework>
     <AssemblyName>ER2AudioMod</AssemblyName>
     <LangVersion>latest</LangVersion>
   </PropertyGroup>
   <ItemGroup>
-    <!-- Update these paths to your BepInEx + game install -->
     <Reference Include="BepInEx.Core">
-      <HintPath>..\..\BepInEx\core\BepInEx.Core.dll</HintPath>
+      <HintPath>{game_path}\\BepInEx\\core\\BepInEx.Core.dll</HintPath>
     </Reference>
     <Reference Include="BepInEx.Unity.IL2CPP">
-      <HintPath>..\..\BepInEx\core\BepInEx.Unity.IL2CPP.dll</HintPath>
+      <HintPath>{game_path}\\BepInEx\\core\\BepInEx.Unity.IL2CPP.dll</HintPath>
     </Reference>
     <Reference Include="HarmonyX">
-      <HintPath>..\..\BepInEx\core\0Harmony.dll</HintPath>
+      <HintPath>{game_path}\\BepInEx\\core\\0Harmony.dll</HintPath>
     </Reference>
-    <Reference Include="UnityEngine">
-      <HintPath>..\..\Easy Red 2_Data\Managed\UnityEngine.dll</HintPath>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>{game_path}\\BepInEx\\interop\\UnityEngine.CoreModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.AudioModule">
+      <HintPath>{game_path}\\BepInEx\\interop\\UnityEngine.AudioModule.dll</HintPath>
     </Reference>
     <Reference Include="Assembly-CSharp">
-      <HintPath>..\..\interop\Assembly-CSharp.dll</HintPath>
+      <HintPath>{game_path}\\BepInEx\\interop\\Assembly-CSharp.dll</HintPath>
     </Reference>
   </ItemGroup>
 </Project>
@@ -788,7 +827,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = unquote(self.path.split("?")[0])
 
-        if path == "/":
+        if path == "/favicon.ico":
+            self.send_response(204)
+            self.end_headers()
+            return
+        elif path == "/":
             self._send(PAGE_HTML, "text/html")
         elif path == "/api/mapping":
             self._send_json(load_mapping())
@@ -803,6 +846,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(load_ro2_catalogue())
         elif path == "/api/profiles":
             self._send_json(list_profiles())
+        elif path == "/api/config":
+            self._send_json(load_config())
         elif path == "/api/rescan":
             data = scan_from_prefabs()
             save_mapping(data)
@@ -843,6 +888,19 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
             self._send_json(delete_profile(body.get("name", "")))
+        elif path == "/api/config":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            config = load_config()
+            game_path = body.get("game_path", "")
+            if game_path:
+                valid, issues = validate_game_path(game_path)
+                config["game_path"] = game_path
+                config["game_path_valid"] = valid
+                config["game_path_issues"] = issues
+            config.update({k: v for k, v in body.items() if k != "game_path"})
+            save_config(config)
+            self._send_json(config)
         else:
             self.send_error(404)
 
@@ -1106,6 +1164,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
   <div id="toolbar">
     <button class="secondary" onclick="rescan()">Rescan</button>
     <button class="secondary" onclick="showProfiles()">Profiles</button>
+    <button class="secondary" onclick="showSettings()">Settings</button>
     <button onclick="exportMod()">Export Mod</button>
     <input type="text" id="clip-filter" placeholder="Filter by filename or action..."
            oninput="renderEntity(currentEntity)" style="background:#1a1a2e;border:1px solid #0f3460;
@@ -1184,6 +1243,11 @@ function renderTabs() {
 }
 
 async function init() {
+  var config = await (await fetch('/api/config')).json();
+  if (!config.game_path) {
+    showSetup();
+    return;
+  }
   var results = await Promise.all([
     fetch('/api/mapping').then(function(r) { return r.json(); }),
     fetch('/api/refs').then(function(r) { return r.json(); }),
@@ -1196,6 +1260,38 @@ async function init() {
   renderTabs();
   renderSidebar();
   updateStats();
+}
+
+function showSetup(error) {
+  var root = document.getElementById('modal-root');
+  var errHtml = error ? '<p style="color:#e94560;margin-bottom:8px;">' + esc(error) + '</p>' : '';
+  root.innerHTML = '<div class="modal-bg">' +
+    '<div class="modal" style="max-width:500px;">' +
+    '<h3>ER2 Audio Editor Setup</h3>' +
+    '<p style="font-size:12px;color:#888;margin-bottom:16px;">Enter your Easy Red 2 install path. BepInEx must be installed and the game launched at least once.</p>' +
+    errHtml +
+    '<label>Game install path</label>' +
+    '<input type="text" id="setup-path" placeholder="D:\\Steam\\steamapps\\common\\Easy Red 2" value="">' +
+    '<div class="btn-row"><button class="btn-ok" onclick="doSetup()">Continue</button></div>' +
+    '</div></div>';
+}
+
+async function doSetup() {
+  var path = document.getElementById('setup-path').value.trim();
+  if (!path) return;
+  var res = await fetch('/api/config', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({game_path: path})
+  });
+  var config = await res.json();
+  if (!config.game_path_valid) {
+    var issues = (config.game_path_issues || []).join(', ');
+    showSetup(issues || 'Invalid path');
+    return;
+  }
+  document.getElementById('modal-root').innerHTML = '';
+  init();
 }
 
 // Keyword map: ER2 action -> search terms for RO2 matching
@@ -1676,6 +1772,40 @@ async function doDeleteProfile(name) {
     body: JSON.stringify({name: name})
   });
   showProfiles();
+}
+
+async function showSettings() {
+  var config = await (await fetch('/api/config')).json();
+  var root = document.getElementById('modal-root');
+  var validHtml = config.game_path_valid ?
+    '<span style="color:#2ecc71;font-size:12px;">Valid</span>' :
+    '<span style="color:#e94560;font-size:12px;">' + esc((config.game_path_issues||[]).join(', ')) + '</span>';
+
+  root.innerHTML = '<div class="modal-bg" onclick="if(event.target===this)closeModal()">' +
+    '<div class="modal" style="max-width:500px;">' +
+    '<h3>Settings</h3>' +
+    '<label>Easy Red 2 install path</label>' +
+    '<input type="text" id="settings-path" value="' + esc(config.game_path || '') + '">' +
+    '<div style="margin-bottom:16px;">' + validHtml + '</div>' +
+    '<div class="btn-row">' +
+    '<button class="btn-cancel" onclick="closeModal()">Cancel</button>' +
+    '<button class="btn-ok" onclick="saveSettings()">Save</button>' +
+    '</div></div></div>';
+}
+
+async function saveSettings() {
+  var path = document.getElementById('settings-path').value.trim();
+  var res = await fetch('/api/config', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({game_path: path})
+  });
+  var config = await res.json();
+  if (!config.game_path_valid) {
+    showSettings();
+    return;
+  }
+  closeModal();
 }
 
 async function exportMod() {
