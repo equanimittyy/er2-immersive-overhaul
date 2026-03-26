@@ -2005,6 +2005,29 @@ function buildRO2Index() {
         });
       }
     }
+    // explosions, environment, character, other
+    var extraCats = ['explosions', 'environment', 'character', 'other'];
+    for (var ci=0; ci<extraCats.length; ci++) {
+      var catName = extraCats[ci];
+      for (var eid in (cats[catName]||{})) {
+        var entry = cats[catName][eid];
+        var eclips = entry.clips||[];
+        for (var i=0; i<eclips.length; i++) {
+          var efname = eclips[i].split('/').pop().replace(/\.\w+$/,'');
+          ro2Index.push({
+            path: eclips[i],
+            game: game,
+            category: catName,
+            entity: eid,
+            action: efname,
+            faction: '',
+            language: '',
+            vtype: '',
+            tokens: tokenize(efname + ' ' + eid + ' ' + catName),
+          });
+        }
+      }
+    }
   }
 }
 
