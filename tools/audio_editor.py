@@ -589,6 +589,21 @@ def delete_profile(name):
 EXPORT_DIR = Path(__file__).resolve().parent.parent / "export" / "ER2AudioMod"
 
 
+def _convert_to_wav(src, dst):
+    """Convert an audio file to WAV using ffmpeg. Returns True on success."""
+    import subprocess
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(src), "-acodec", "pcm_s16le", str(dst)],
+            check=True, capture_output=True,
+        )
+        return True
+    except FileNotFoundError:
+        return False
+    except subprocess.CalledProcessError:
+        return False
+
+
 def export_mod():
     """Export all swaps as a BepInEx mod package with plugin source."""
     import shutil
@@ -608,15 +623,23 @@ def export_mod():
     audio_dir.mkdir(parents=True)
 
     # Copy custom files and build manifest
+    # AudioClipLoader only supports WAV — convert non-WAV files
     manifest = {}
+    convert_failures = []
     for original, custom_name in swaps.items():
         custom_src = CUSTOM_DIR / custom_name
         if not custom_src.exists():
             continue
 
-        custom_ext = Path(custom_name).suffix
-        export_name = Path(original).stem + custom_ext
-        shutil.copy2(custom_src, audio_dir / export_name)
+        export_name = Path(original).stem + ".wav"
+        dst = audio_dir / export_name
+
+        if Path(custom_name).suffix.lower() == ".wav":
+            shutil.copy2(custom_src, dst)
+        else:
+            if not _convert_to_wav(custom_src, dst):
+                convert_failures.append(custom_name)
+                continue
 
         clip_refs = refs_data.get(original, [])
         manifest[original] = {
@@ -630,6 +653,14 @@ def export_mod():
 
     # Write C# plugin source
     _write_plugin_source(EXPORT_DIR)
+
+    if convert_failures:
+        return {
+            "ok": False,
+            "error": f"ffmpeg failed to convert {len(convert_failures)} file(s): "
+                     + ", ".join(convert_failures)
+                     + ". Install ffmpeg or use WAV files instead.",
+        }
 
     return {
         "ok": True,
@@ -713,14 +744,21 @@ namespace ER2AudioMod
 
                 try
                 {
-                    using var stream = File.OpenRead(filePath);
-                    AudioClipLoader.LoadAudioClipFromStreamAsync(stream, kvp.Value, clip =>
-                    {
-                        if (clip != null)
+                    var bytes = File.ReadAllBytes(filePath);
+                    var il2cppStream = new Il2CppSystem.IO.MemoryStream(bytes);
+                    var originalKey = kvp.Key;
+
+                    AudioClipLoader.LoadAudioClipFromStreamAsync(
+                        il2cppStream.Cast<Il2CppSystem.IO.Stream>(),
+                        kvp.Value,
+                        (Il2CppSystem.Action<AudioClip>)new System.Action<AudioClip>(clip =>
                         {
-                            ReplacementClips[kvp.Key] = clip;
-                        }
-                    });
+                            if (clip != null)
+                            {
+                                ReplacementClips[originalKey] = clip;
+                            }
+                        })
+                    );
                 }
                 catch (Exception ex)
                 {
@@ -797,6 +835,18 @@ namespace ER2AudioMod
     </Reference>
     <Reference Include="Assembly-CSharp">
       <HintPath>{game_path}\\BepInEx\\interop\\Assembly-CSharp.dll</HintPath>
+    </Reference>
+    <Reference Include="Il2Cppmscorlib">
+      <HintPath>{game_path}\\BepInEx\\interop\\Il2Cppmscorlib.dll</HintPath>
+    </Reference>
+    <Reference Include="Il2CppInterop.Runtime">
+      <HintPath>{game_path}\\BepInEx\\core\\Il2CppInterop.Runtime.dll</HintPath>
+    </Reference>
+    <Reference Include="Il2CppSystem">
+      <HintPath>{game_path}\\BepInEx\\interop\\Il2CppSystem.dll</HintPath>
+    </Reference>
+    <Reference Include="Il2CppSystem.Core">
+      <HintPath>{game_path}\\BepInEx\\interop\\Il2CppSystem.Core.dll</HintPath>
     </Reference>
   </ItemGroup>
 </Project>

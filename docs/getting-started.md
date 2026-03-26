@@ -5,6 +5,7 @@
 - **BepInEx 6** (Bleeding Edge, IL2CPP x64, build 717+)
 - **C# / .NET** knowledge
 - **Audacity** or similar for preparing WAV files
+- **ffmpeg** — required if your replacement audio is OGG/MP3 (the game's `AudioClipLoader` only supports WAV, so the export converts non-WAV files automatically). Download from [ffmpeg.org/download.html](https://ffmpeg.org/download.html) and add to PATH
 - **Cpp2IL** (2022.1.0-pre-release.21+) or **Il2CppDumper** for decompiling
 - **dnSpy** or **ILSpy** for browsing the dummy DLLs
 

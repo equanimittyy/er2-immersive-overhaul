@@ -10,6 +10,7 @@
 | BepInEx 6 BE | IL2CPP mod loader | github.com/BepInEx/BepInEx |
 | HarmonyX | Runtime method patching | (bundled with BepInEx 6) |
 | Audacity | Audio editing | audacityteam.org |
+| ffmpeg | Audio format conversion (OGG→WAV at export) | ffmpeg.org/download.html |
 
 ## Decompilation Notes
 
