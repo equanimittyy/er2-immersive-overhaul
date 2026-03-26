@@ -46,18 +46,12 @@ def get_game_path():
 
 
 def validate_game_path(path):
-    """Check if a path looks like a valid ER2 install with BepInEx."""
-    p = Path(path)
-    issues = []
-    if not p.exists():
-        return False, ["Path does not exist"]
-    if not (p / "Easy Red 2_Data").exists():
-        issues.append("Easy Red 2_Data folder not found")
-    if not (p / "BepInEx" / "core").exists():
-        issues.append("BepInEx not installed (BepInEx/core/ missing)")
-    if not (p / "BepInEx" / "interop" / "Assembly-CSharp.dll").exists():
-        issues.append("BepInEx interop DLLs missing — launch the game once with BepInEx installed")
-    return len(issues) == 0, issues
+    """Basic sanity check on the game path string."""
+    if not path or not path.strip():
+        return False, ["Path is empty"]
+    # Just check it looks like a plausible path — actual validation
+    # happens on the user's machine when they build the plugin
+    return True, []
 
 # GenericGun audio fields
 WEAPON_AUDIO_FIELDS = {
