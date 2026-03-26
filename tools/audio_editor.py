@@ -10,6 +10,7 @@ import mimetypes
 import os
 import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -27,6 +28,8 @@ SWAP_SOURCES_FILE = DATA_DIR / "swap_sources.json"
 CONFIG_FILE = DATA_DIR / "config.json"
 PORT = 8420
 _audio_info_cache = {}  # populated at startup
+_mapping_cache = None
+_refs_cache = None
 
 
 def load_config():
@@ -575,27 +578,32 @@ def _backfill_swap_sources():
     return sources
 
 
+_swap_sources_cache = None
+
 def load_swap_sources():
+    global _swap_sources_cache
+    if _swap_sources_cache is not None:
+        return _swap_sources_cache
     if SWAP_SOURCES_FILE.exists():
         with open(SWAP_SOURCES_FILE) as f:
-            sources = json.load(f)
-        # Check if backfill is needed
-        swaps = load_swaps()
-        missing = any(orig not in sources and "_ro2" in swaps.get(orig, "")
-                       for orig in swaps)
-        if missing:
-            return _backfill_swap_sources()
-        return sources
-    # First load — try to backfill
-    if load_swaps():
-        return _backfill_swap_sources()
-    return {}
+            _swap_sources_cache = json.load(f)
+    else:
+        _swap_sources_cache = {}
+    return _swap_sources_cache
+
+
+def reload_swap_sources():
+    global _swap_sources_cache
+    _swap_sources_cache = None
+    return load_swap_sources()
 
 
 def save_swap_sources(sources):
+    global _swap_sources_cache
     SWAP_SOURCES_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(SWAP_SOURCES_FILE, "w") as f:
         json.dump(sources, f, indent=2)
+    _swap_sources_cache = sources
 
 
 PROFILES_DIR = DATA_DIR / "profiles"
@@ -728,7 +736,7 @@ def _audio_rms(filepath):
 
 def _apply_gain_wav(filepath, gain):
     """Apply a linear gain factor to a WAV file in-place."""
-    import struct, wave
+    import struct, tempfile, wave
     try:
         with wave.open(str(filepath), "rb") as w:
             params = w.getparams()
@@ -753,9 +761,22 @@ def _apply_gain_wav(filepath, gain):
         else:
             return
 
-        with wave.open(str(filepath), "wb") as w:
-            w.setparams(params)
-            w.writeframes(raw_out)
+        # Write to temp file then replace to avoid read/write conflict
+        import warnings
+        fd, tmp_path = tempfile.mkstemp(suffix=".wav", dir=str(Path(filepath).parent))
+        try:
+            os.close(fd)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                with wave.open(tmp_path, "wb") as w:
+                    w.setparams(params)
+                    w.writeframes(raw_out)
+            os.replace(tmp_path, str(filepath))
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
     except Exception:
         pass
 
@@ -788,10 +809,16 @@ def export_mod():
 
     # Clean and recreate export dir
     if EXPORT_DIR.exists():
-        shutil.rmtree(EXPORT_DIR)
+        for attempt in range(3):
+            try:
+                shutil.rmtree(EXPORT_DIR)
+                break
+            except OSError:
+                import time
+                time.sleep(0.5)
 
     audio_dir = EXPORT_DIR / "audio"
-    audio_dir.mkdir(parents=True)
+    audio_dir.mkdir(parents=True, exist_ok=True)
 
     # Copy custom files and build manifest
     # AudioClipLoader only supports WAV — convert non-WAV files
@@ -1295,6 +1322,18 @@ namespace ER2AudioMod
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
+        try:
+            self._route_get()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            try:
+                self._send_json({"error": str(e)})
+            except Exception:
+                pass
+
+    def _route_get(self):
+        global _mapping_cache, _refs_cache
         path = unquote(self.path.split("?")[0])
 
         if path == "/favicon.ico":
@@ -1304,10 +1343,9 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/":
             self._send(PAGE_HTML, "text/html")
         elif path == "/api/mapping":
-            self._send_json(load_mapping())
+            self._send_json(_mapping_cache or load_mapping())
         elif path == "/api/refs":
-            data = load_mapping()
-            self._send_json(build_refs(data))
+            self._send_json(_refs_cache or build_refs(load_mapping()))
         elif path == "/api/swaps":
             self._send_json(load_swaps())
         elif path == "/api/swap-sources":
@@ -1321,9 +1359,10 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/config":
             self._send_json(load_config())
         elif path == "/api/rescan":
-            data = scan_from_prefabs()
-            save_mapping(data)
-            self._send_json(data)
+            _mapping_cache = scan_from_prefabs()
+            save_mapping(_mapping_cache)
+            _refs_cache = build_refs(_mapping_cache)
+            self._send_json(_mapping_cache)
         elif path.startswith("/audio/"):
             self._serve_audio(unquote(path[7:]))
         elif path.startswith("/ro2audio/"):
@@ -1334,6 +1373,17 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
+        try:
+            self._route_post()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            try:
+                self._send_json({"error": str(e)})
+            except Exception:
+                pass
+
+    def _route_post(self):
         path = unquote(self.path)
 
         if path == "/api/swap":
@@ -1732,15 +1782,21 @@ async function init() {
     showSetup();
     return;
   }
-  var results = await Promise.all([
-    fetch('/api/mapping').then(function(r) { return r.json(); }),
-    fetch('/api/refs').then(function(r) { return r.json(); }),
-    fetch('/api/swaps').then(function(r) { return r.json(); }),
-    fetch('/api/audioinfo').then(function(r) { return r.json(); }),
-    fetch('/api/ro2').then(function(r) { return r.json(); }),
-    fetch('/api/swap-sources').then(function(r) { return r.json(); }),
-  ]);
-  data = results[0]; refs = results[1]; swaps = results[2]; audioInfo = results[3]; ro2 = results[4]; swapSources = results[5];
+  try {
+    var results = await Promise.all([
+      fetch('/api/mapping').then(function(r) { return r.json(); }),
+      fetch('/api/refs').then(function(r) { return r.json(); }),
+      fetch('/api/swaps').then(function(r) { return r.json(); }),
+      fetch('/api/audioinfo').then(function(r) { return r.json(); }),
+      fetch('/api/ro2').then(function(r) { return r.json(); }),
+      fetch('/api/swap-sources').then(function(r) { return r.json(); }),
+    ]);
+    data = results[0]; refs = results[1]; swaps = results[2]; audioInfo = results[3]; ro2 = results[4]; swapSources = results[5];
+  } catch(e) {
+    console.error('Init fetch error:', e);
+    document.getElementById('content').innerHTML = '<p style="color:#e94560;padding:40px;">Failed to load data. Check the server console and refresh.</p>';
+    return;
+  }
   buildRO2Index();
   renderTabs();
   renderSidebar();
@@ -2341,9 +2397,14 @@ async function saveSettings() {
 }
 
 async function exportMod() {
+  var root = document.getElementById('modal-root');
+  root.innerHTML = '<div class="modal-bg">' +
+    '<div class="modal" style="text-align:center;padding:40px;">' +
+    '<h3>Exporting...</h3>' +
+    '<p style="color:#888;margin-top:12px;">Converting and equalizing audio files</p>' +
+    '</div></div>';
   var res = await fetch('/api/export', { method: 'POST' });
   var result = await res.json();
-  var root = document.getElementById('modal-root');
   if (result.ok) {
     root.innerHTML = '<div class="modal-bg" onclick="if(event.target===this)closeModal()">' +
       '<div class="modal">' +
@@ -2384,21 +2445,29 @@ init();
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import time
+    import time, wave
+    # Silence harmless Wave_write.__del__ AttributeError on corrupt/unusual WAVs
+    _orig_wave_del = wave.Wave_write.__del__
+    def _safe_wave_del(self):
+        try:
+            _orig_wave_del(self)
+        except AttributeError:
+            pass
+    wave.Wave_write.__del__ = _safe_wave_del
 
-    print(f"[1/4] Building ER2 mapping from prefabs...")
+    print(f"[1/5] Building ER2 mapping from prefabs...")
     t0 = time.time()
-    mapping_data = load_mapping()
-    voices = mapping_data.get("voices", {})
+    _mapping_cache = load_mapping()
+    voices = _mapping_cache.get("voices", {})
     total = sum(len(clips) for ent in voices.values() for clips in ent.values())
     uncat = len(voices.get("Uncategorised", {}).get("misc", []))
     print(f"      {len(voices)} entities, {total} clips ({time.time()-t0:.1f}s)")
 
-    print(f"[2/4] Building cross-references...")
+    print(f"[2/5] Building cross-references...")
     t0 = time.time()
-    _refs = build_refs(mapping_data)
-    shared = sum(1 for v in _refs.values() if len(v) > 1)
-    print(f"      {len(_refs)} clips, {shared} shared ({time.time()-t0:.1f}s)")
+    _refs_cache = build_refs(_mapping_cache)
+    shared = sum(1 for v in _refs_cache.values() if len(v) > 1)
+    print(f"      {len(_refs_cache)} clips, {shared} shared ({time.time()-t0:.1f}s)")
 
     print(f"[3/4] Scanning RO2/RS catalogue...")
     t0 = time.time()
@@ -2409,17 +2478,24 @@ if __name__ == "__main__":
     )
     print(f"      {ro2_total} RO2/RS clips ({time.time()-t0:.1f}s)")
 
-    print(f"[4/4] Building audio info cache...")
+    print(f"[4/5] Building audio info cache...")
     t0 = time.time()
     _audio_info_cache = build_audio_info_cache()
     print(f"      {len(_audio_info_cache)} files scanned ({time.time()-t0:.1f}s)")
 
+    print(f"[5/5] Backfilling RO2 swap sources...")
+    t0 = time.time()
+    _backfill_swap_sources()
+    _ss = load_swap_sources()
+    print(f"      {len(_ss)} sources tracked ({time.time()-t0:.1f}s)")
+
     print(f"\nStarting server at http://localhost:{PORT}")
 
-    class ReusableHTTPServer(HTTPServer):
+    class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
         allow_reuse_address = True
+        daemon_threads = True
 
-    server = ReusableHTTPServer(("0.0.0.0", PORT), Handler)
+    server = ThreadedHTTPServer(("0.0.0.0", PORT), Handler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
