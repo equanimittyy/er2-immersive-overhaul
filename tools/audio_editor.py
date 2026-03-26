@@ -589,6 +589,105 @@ def delete_profile(name):
 EXPORT_DIR = Path(__file__).resolve().parent.parent / "export" / "ER2AudioMod"
 
 
+def _wav_rms(filepath):
+    """Compute RMS loudness of a WAV file. Returns float or None."""
+    import math, struct, wave
+    try:
+        with wave.open(str(filepath), "rb") as w:
+            n = w.getnframes()
+            if n == 0:
+                return None
+            sw = w.getsampwidth()
+            raw = w.readframes(n)
+            ch = w.getnchannels()
+            total = n * ch
+            if sw == 2:
+                samples = struct.unpack(f"<{total}h", raw)
+                peak = 32768.0
+            elif sw == 3:
+                samples = []
+                for i in range(0, len(raw), 3):
+                    val = int.from_bytes(raw[i:i+3], "little", signed=True)
+                    samples.append(val)
+                peak = 8388608.0
+            elif sw == 1:
+                samples = struct.unpack(f"{total}B", raw)
+                samples = [s - 128 for s in samples]
+                peak = 128.0
+            else:
+                return None
+            sum_sq = sum(s * s for s in samples)
+            rms = math.sqrt(sum_sq / total) / peak
+            return rms if rms > 0 else None
+    except Exception:
+        return None
+
+
+def _ogg_rms(filepath):
+    """Compute RMS of an OGG file by decoding to WAV via ffmpeg. Returns float or None."""
+    import subprocess, tempfile
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_path = tmp.name
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(filepath), "-acodec", "pcm_s16le", tmp_path],
+            check=True, capture_output=True,
+        )
+        rms = _wav_rms(tmp_path)
+        os.unlink(tmp_path)
+        return rms
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+        return None
+
+
+def _audio_rms(filepath):
+    """Compute RMS of a WAV or OGG file."""
+    ext = Path(filepath).suffix.lower()
+    if ext == ".wav":
+        return _wav_rms(filepath)
+    elif ext == ".ogg":
+        return _ogg_rms(filepath)
+    return None
+
+
+def _apply_gain_wav(filepath, gain):
+    """Apply a linear gain factor to a WAV file in-place."""
+    import struct, wave
+    try:
+        with wave.open(str(filepath), "rb") as w:
+            params = w.getparams()
+            n = w.getnframes()
+            sw = w.getsampwidth()
+            raw = w.readframes(n)
+
+        ch = params.nchannels
+        total = n * ch
+
+        if sw == 2:
+            samples = list(struct.unpack(f"<{total}h", raw))
+            clamped = [max(-32768, min(32767, int(s * gain))) for s in samples]
+            raw_out = struct.pack(f"<{total}h", *clamped)
+        elif sw == 3:
+            samples = []
+            for i in range(0, len(raw), 3):
+                val = int.from_bytes(raw[i:i+3], "little", signed=True)
+                samples.append(val)
+            clamped = [max(-8388608, min(8388607, int(s * gain))) for s in samples]
+            raw_out = b"".join(v.to_bytes(3, "little", signed=True) for v in clamped)
+        else:
+            return
+
+        with wave.open(str(filepath), "wb") as w:
+            w.setparams(params)
+            w.writeframes(raw_out)
+    except Exception:
+        pass
+
+
 def _convert_to_wav(src, dst):
     """Convert an audio file to WAV using ffmpeg. Returns True on success."""
     import subprocess
@@ -626,6 +725,7 @@ def export_mod():
     # AudioClipLoader only supports WAV — convert non-WAV files
     manifest = {}
     convert_failures = []
+    equalized = 0
     for original, custom_name in swaps.items():
         custom_src = CUSTOM_DIR / custom_name
         if not custom_src.exists():
@@ -640,6 +740,17 @@ def export_mod():
             if not _convert_to_wav(custom_src, dst):
                 convert_failures.append(custom_name)
                 continue
+
+        # Volume equalization: match replacement loudness to original
+        original_path = AUDIO_DIR / original
+        if original_path.exists():
+            orig_rms = _audio_rms(original_path)
+            repl_rms = _wav_rms(dst)
+            if orig_rms and repl_rms:
+                gain = orig_rms / repl_rms
+                if abs(gain - 1.0) > 0.05:  # only adjust if >5% difference
+                    _apply_gain_wav(dst, gain)
+                    equalized += 1
 
         clip_refs = refs_data.get(original, [])
         manifest[original] = {
@@ -667,6 +778,7 @@ def export_mod():
         "path": str(EXPORT_DIR),
         "swaps": len(manifest),
         "files": len(list(audio_dir.iterdir())),
+        "equalized": equalized,
     }
 
 
@@ -2148,7 +2260,7 @@ async function exportMod() {
     root.innerHTML = '<div class="modal-bg" onclick="if(event.target===this)closeModal()">' +
       '<div class="modal">' +
       '<h3>Mod Exported</h3>' +
-      '<p style="margin-bottom:12px;">' + result.swaps + ' swaps exported, ' + result.files + ' audio files.</p>' +
+      '<p style="margin-bottom:12px;">' + result.swaps + ' swaps exported, ' + result.files + ' audio files' + (result.equalized ? ', ' + result.equalized + ' volume-equalized' : '') + '.</p>' +
       '<p style="font-size:12px;color:#888;margin-bottom:8px;">Output: <code>' + esc(result.path) + '</code></p>' +
       '<p style="font-size:12px;color:#888;margin-bottom:8px;">1. Build: <code>cd src &amp;&amp; dotnet build -c Release</code></p>' +
       '<p style="font-size:12px;color:#888;margin-bottom:8px;">2. Copy the built <code>ER2AudioMod.dll</code> into the export folder alongside <code>manifest.json</code> + <code>audio/</code></p>' +
