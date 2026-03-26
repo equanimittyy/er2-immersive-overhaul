@@ -527,10 +527,68 @@ def save_swaps(swaps):
         json.dump(swaps, f, indent=2)
 
 
+def _backfill_swap_sources():
+    """Match existing _ro2 custom files back to their RO2 source paths."""
+    swaps = load_swaps()
+    sources = {}
+    if SWAP_SOURCES_FILE.exists():
+        with open(SWAP_SOURCES_FILE) as f:
+            sources = json.load(f)
+
+    missing = {orig: cname for orig, cname in swaps.items()
+               if orig not in sources and "_ro2" in cname}
+    if not missing:
+        return sources
+
+    # Build size -> [ro2_path] index for fast matching
+    size_index = {}
+    if RO2_DIR.exists():
+        for f in RO2_DIR.rglob("*"):
+            if f.is_file() and f.suffix.lower() in (".ogg", ".wav"):
+                rel = str(f.relative_to(RO2_DIR))
+                size_index.setdefault(f.stat().st_size, []).append(rel)
+
+    matched = 0
+    for orig, cname in missing.items():
+        custom_path = CUSTOM_DIR / cname
+        if not custom_path.exists():
+            continue
+        csize = custom_path.stat().st_size
+        candidates = size_index.get(csize, [])
+        if len(candidates) == 1:
+            sources[orig] = candidates[0]
+            matched += 1
+        elif len(candidates) > 1:
+            # Multiple same-size files — compare bytes to find exact match
+            cbytes = custom_path.read_bytes()
+            for ro2_rel in candidates:
+                if (RO2_DIR / ro2_rel).read_bytes() == cbytes:
+                    sources[orig] = ro2_rel
+                    matched += 1
+                    break
+
+    if matched:
+        save_swap_sources(sources)
+        import time
+        print(f"      Backfilled {matched} RO2 source(s) ({time.time():.0f})")
+
+    return sources
+
+
 def load_swap_sources():
     if SWAP_SOURCES_FILE.exists():
         with open(SWAP_SOURCES_FILE) as f:
-            return json.load(f)
+            sources = json.load(f)
+        # Check if backfill is needed
+        swaps = load_swaps()
+        missing = any(orig not in sources and "_ro2" in swaps.get(orig, "")
+                       for orig in swaps)
+        if missing:
+            return _backfill_swap_sources()
+        return sources
+    # First load — try to backfill
+    if load_swaps():
+        return _backfill_swap_sources()
     return {}
 
 
