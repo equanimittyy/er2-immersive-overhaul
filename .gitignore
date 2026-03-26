@@ -1,8 +1,10 @@
 # Extracted game assets (large binary files, not suitable for git)
 data/
 
-# Mod export output
+# Mod export output (except plugin source)
 export/
+!export/ER2AudioMod/src/
+!export/ER2AudioMod/src/**
 
 # Python
 .venv/
