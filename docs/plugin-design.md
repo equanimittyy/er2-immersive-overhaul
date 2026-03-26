@@ -1,77 +1,75 @@
 # Plugin Design
 
-## Folder Structure
+## Mod Structure
+
+The exported mod uses a manifest-driven approach. The audio editor generates all of this via **Export Mod**.
 
 ```
 Easy Red 2/
 └── BepInEx/
     └── plugins/
         └── ER2AudioMod/
-            ├── ER2AudioMod.dll          # The compiled plugin
-            ├── Weapons/
-            │   ├── fireSound/           # Single shot replacements
-            │   │   └── *.wav
-            │   ├── fireSound_loop/      # Looped fire replacements
-            │   │   └── *.wav
-            │   ├── fireSound_tail/      # Fire tail replacements
-            │   │   └── *.wav
-            │   ├── fireSound_distance/  # Distant shot replacements
-            │   │   └── *.wav
-            │   └── ...                  # Other sound categories
-            └── Voices/
-                ├── iVeBeenHit/
-                │   └── *.wav
-                ├── medic/
-                │   └── *.wav
-                ├── imReloading/
-                │   └── *.wav
-                ├── enemyInfantrySpotted/
-                │   └── *.wav
-                └── ...                  # Other voice categories
+            ├── ER2AudioMod.dll      # Compiled plugin (see Building below)
+            ├── manifest.json        # Maps original clip -> replacement file
+            └── audio/
+                ├── ger1_gotHit1.ogg # Replacement clips
+                ├── vehicle_crash_1.wav
+                └── ...
+```
+
+`manifest.json` structure:
+```json
+{
+  "ger1_gotHit1.wav": {
+    "replacement": "ger1_gotHit1.ogg",
+    "references": [
+      {"entity": "Voice-ger-1", "action": "iVeBeenHit"}
+    ]
+  }
+}
 ```
 
 ## Loading Strategy
 
-1. **On plugin startup (`Awake`):** Scan the folder structure above
-2. **For each WAV file found:** Use `AudioClipLoader.LoadAudioClipFromStreamAsync()` to load it into an `AudioClip`
-3. **Cache all loaded clips** in dictionaries keyed by category name
-4. **Apply Harmony patches** that swap clips at the right interception points
+1. **On plugin startup (`Load`):** Read `manifest.json` from the plugin directory
+2. **For each entry:** Load the replacement file from `audio/` using `AudioClipLoader.LoadAudioClipFromStreamAsync()`
+3. **Cache all loaded clips** in a dictionary keyed by original filename
+4. **Apply Harmony patches** that swap clips at the interception points below
 
 ## Harmony Patches — Weapons
 
-**Option A: Patch `PlayFireSound`** — intercept the method and swap the `AudioClip` fields on the `GenericGun` instance before the original method reads them.
+Patch `GenericGun.PlayFireSound` — intercept and swap `AudioClip` fields before the original method reads them. The plugin matches by the original clip's name against the manifest.
 
 ```csharp
-[HarmonyPatch(typeof(GenericGun), "PlayFireSound")]
+[HarmonyPatch(typeof(GenericGun), nameof(GenericGun.PlayFireSound))]
 class Patch_PlayFireSound
 {
     static void Prefix(GenericGun __instance)
     {
-        if (AudioModPlugin.WeaponClips.TryGetValue("fireSound", out var clip))
-            __instance.fireSound = clip;
+        var clips = AudioModPlugin.ReplacementClips;
 
-        if (AudioModPlugin.WeaponClips.TryGetValue("fireSound_loop", out var loopClip))
-            __instance.fireSound_loop = loopClip;
+        if (__instance.fireSound != null &&
+            clips.TryGetValue(__instance.fireSound.name + ".wav", out var c))
+            __instance.fireSound = c;
 
-        // ... etc for each sound field
+        // Same for fireSound_loop, fireSound_tail, fireSound_start,
+        // fireSound_distance, fireSound_distance_loop, fireSound_distance_tail
     }
 }
 ```
 
-**Option B: Patch `GenericGun.Fire`** or `OnGunFire` for more control over when replacements happen.
-
 ## Harmony Patches — Voices
 
-**Option A: Patch `VoiceManager.GetVoice`** — return a custom clip instead.
+Patch `VoiceManager.GetVoice` — return a replacement clip instead of the original.
 
 ```csharp
-[HarmonyPatch(typeof(VoiceManager), "GetVoice")]
+[HarmonyPatch(typeof(VoiceManager), nameof(VoiceManager.GetVoice))]
 class Patch_GetVoice
 {
     static bool Prefix(VoiceManager.VoiceClip clip, int index,
                        ref AudioClip __result)
     {
-        string category = clip.ToString(); // e.g. "medic"
+        string category = clip.ToString();
         if (AudioModPlugin.VoiceClips.TryGetValue(category, out var clips)
             && clips.Length > 0)
         {
@@ -86,7 +84,34 @@ class Patch_GetVoice
 }
 ```
 
-**Option B: Replace the arrays directly** on each `VoiceManager` instance after it loads, using a postfix patch on `Soldier.GetSoldierVoice`.
+## Building the Plugin DLL
+
+The audio editor's **Export Mod** generates plugin source code in `src/`. To compile:
+
+### Prerequisites
+
+- [.NET 6.0 SDK](https://dotnet.microsoft.com/download/dotnet/6.0) or later
+- BepInEx 6 Bleeding Edge installed in your ER2 game folder
+- Cpp2IL dummy DLLs generated (see [Tools & Decompilation](tools-and-decompilation.md))
+
+### Steps
+
+1. Run **Export Mod** in the audio editor — this creates `data/export/BepInEx/plugins/ER2AudioMod/`
+2. Open a terminal in the `src/` subfolder of the export
+3. Update the `<HintPath>` entries in `ER2AudioMod.csproj` to point to your local paths:
+   - `BepInEx.Core.dll`, `BepInEx.Unity.IL2CPP.dll`, `0Harmony.dll` — from `BepInEx/core/`
+   - `UnityEngine.dll` — from `Easy Red 2_Data/Managed/`
+   - `Assembly-CSharp.dll` — from your Cpp2IL `interop/` output
+4. Build:
+   ```
+   dotnet build -c Release
+   ```
+5. Copy the output `ER2AudioMod.dll` into `BepInEx/plugins/ER2AudioMod/` alongside `manifest.json` and `audio/`
+6. Launch the game
+
+### Verifying
+
+Check `BepInEx/LogOutput.log` after launching — the plugin logs how many replacement clips were loaded.
 
 ## See Also
 

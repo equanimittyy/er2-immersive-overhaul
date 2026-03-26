@@ -24,6 +24,7 @@ MAPPING_FILE = DATA_DIR / "audio_mapping.json"
 RO2_CATALOGUE_FILE = DATA_DIR / "ro2_catalogue.json"
 SWAPS_FILE = DATA_DIR / "swaps.json"
 PORT = 8420
+_audio_info_cache = {}  # populated at startup
 
 # GenericGun audio fields
 WEAPON_AUDIO_FIELDS = {
@@ -498,11 +499,71 @@ def save_swaps(swaps):
         json.dump(swaps, f, indent=2)
 
 
+PROFILES_DIR = DATA_DIR / "profiles"
+
+
+def list_profiles():
+    if not PROFILES_DIR.exists():
+        return []
+    return sorted(p.stem for p in PROFILES_DIR.glob("*.json"))
+
+
+def save_profile(name):
+    """Save current swaps + custom files as a named profile."""
+    import shutil
+    PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+    swaps = load_swaps()
+    profile = {"swaps": swaps}
+    with open(PROFILES_DIR / f"{name}.json", "w") as f:
+        json.dump(profile, f, indent=2)
+    # Copy custom files into profile dir
+    profile_audio = PROFILES_DIR / name
+    if profile_audio.exists():
+        shutil.rmtree(profile_audio)
+    profile_audio.mkdir()
+    for custom_name in swaps.values():
+        src = CUSTOM_DIR / custom_name
+        if src.exists():
+            shutil.copy2(src, profile_audio / custom_name)
+    return {"ok": True, "name": name, "swaps": len(swaps)}
+
+
+def load_profile(name):
+    """Load a named profile, replacing current swaps."""
+    import shutil
+    profile_path = PROFILES_DIR / f"{name}.json"
+    if not profile_path.exists():
+        return {"ok": False, "error": "Profile not found"}
+    with open(profile_path) as f:
+        profile = json.load(f)
+    # Restore swaps
+    save_swaps(profile["swaps"])
+    # Restore custom files
+    CUSTOM_DIR.mkdir(parents=True, exist_ok=True)
+    profile_audio = PROFILES_DIR / name
+    if profile_audio.exists():
+        for f in profile_audio.iterdir():
+            if f.is_file():
+                shutil.copy2(f, CUSTOM_DIR / f.name)
+    return {"ok": True, "name": name, "swaps": len(profile["swaps"])}
+
+
+def delete_profile(name):
+    import shutil
+    profile_path = PROFILES_DIR / f"{name}.json"
+    profile_audio = PROFILES_DIR / name
+    if profile_path.exists():
+        profile_path.unlink()
+    if profile_audio.exists():
+        shutil.rmtree(profile_audio)
+    return {"ok": True}
+
+
 EXPORT_DIR = DATA_DIR / "export" / "BepInEx" / "plugins" / "ER2AudioMod"
 
 
 def export_mod():
-    """Export all swaps as a BepInEx mod package."""
+    """Export all swaps as a BepInEx mod package with plugin source."""
     import shutil
 
     swaps = load_swaps()
@@ -510,7 +571,7 @@ def export_mod():
         return {"ok": False, "error": "No swaps to export"}
 
     data = load_mapping()
-    refs = build_refs(data)
+    refs_data = build_refs(data)
 
     # Clean and recreate export dir
     export_root = DATA_DIR / "export"
@@ -527,14 +588,11 @@ def export_mod():
         if not custom_src.exists():
             continue
 
-        # Use original filename as the replacement name so the plugin
-        # can match by name. Keep the custom file's actual extension.
         custom_ext = Path(custom_name).suffix
         export_name = Path(original).stem + custom_ext
         shutil.copy2(custom_src, audio_dir / export_name)
 
-        # Build manifest entry with full reference info
-        clip_refs = refs.get(original, [])
+        clip_refs = refs_data.get(original, [])
         manifest[original] = {
             "replacement": export_name,
             "references": clip_refs,
@@ -544,12 +602,182 @@ def export_mod():
     with open(EXPORT_DIR / "manifest.json", "w") as f:
         json.dump(manifest, f, indent=2)
 
+    # Write C# plugin source
+    _write_plugin_source(EXPORT_DIR)
+
     return {
         "ok": True,
         "path": str(EXPORT_DIR),
         "swaps": len(manifest),
         "files": len(list(audio_dir.iterdir())),
     }
+
+
+def _write_plugin_source(export_dir):
+    """Write the BepInEx plugin C# source + project file."""
+    src_dir = export_dir / "src"
+    src_dir.mkdir(parents=True, exist_ok=True)
+
+    # Plugin source
+    plugin_cs = r'''using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Reflection;
+using BepInEx;
+using BepInEx.Unity.IL2CPP;
+using HarmonyLib;
+using UnityEngine;
+
+namespace ER2AudioMod
+{
+    [BepInPlugin("com.er2.audiomod", "ER2 Audio Mod", "1.0.0")]
+    public class AudioModPlugin : BasePlugin
+    {
+        internal static string PluginDir;
+        internal static Dictionary<string, AudioClip> ReplacementClips = new();
+        internal static Dictionary<string, string> Manifest = new();
+
+        public override void Load()
+        {
+            PluginDir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
+            LoadManifest();
+            LoadAudioClips();
+
+            var harmony = new Harmony("com.er2.audiomod");
+            harmony.PatchAll();
+
+            Log.LogInfo($"ER2 Audio Mod loaded: {ReplacementClips.Count} replacements");
+        }
+
+        private void LoadManifest()
+        {
+            var manifestPath = Path.Combine(PluginDir, "manifest.json");
+            if (!File.Exists(manifestPath)) return;
+
+            // Simple JSON parse for {"original": {"replacement": "file.wav", ...}}
+            var json = File.ReadAllText(manifestPath);
+            // Using Il2Cpp-safe parsing - split by entries
+            var lines = json.Split('\n');
+            string currentOriginal = null;
+            foreach (var line in lines)
+            {
+                var trimmed = line.Trim();
+                if (trimmed.StartsWith("\"") && trimmed.Contains("\": {"))
+                {
+                    currentOriginal = trimmed.Split('"')[1];
+                }
+                else if (trimmed.Contains("\"replacement\"") && currentOriginal != null)
+                {
+                    var replacement = trimmed.Split('"')[3];
+                    Manifest[currentOriginal] = replacement;
+                    currentOriginal = null;
+                }
+            }
+        }
+
+        private void LoadAudioClips()
+        {
+            var audioDir = Path.Combine(PluginDir, "audio");
+            if (!Directory.Exists(audioDir)) return;
+
+            foreach (var kvp in Manifest)
+            {
+                var filePath = Path.Combine(audioDir, kvp.Value);
+                if (!File.Exists(filePath)) continue;
+
+                try
+                {
+                    using var stream = File.OpenRead(filePath);
+                    AudioClipLoader.LoadAudioClipFromStreamAsync(stream, kvp.Value, clip =>
+                    {
+                        if (clip != null)
+                        {
+                            ReplacementClips[kvp.Key] = clip;
+                        }
+                    });
+                }
+                catch (Exception ex)
+                {
+                    Log.LogError($"Failed to load {kvp.Value}: {ex.Message}");
+                }
+            }
+        }
+    }
+
+    // Patch weapon sounds
+    [HarmonyPatch(typeof(GenericGun), nameof(GenericGun.PlayFireSound))]
+    class Patch_PlayFireSound
+    {
+        static void Prefix(GenericGun __instance)
+        {
+            var clips = AudioModPlugin.ReplacementClips;
+
+            if (__instance.fireSound != null && clips.TryGetValue(__instance.fireSound.name + ".wav", out var c1))
+                __instance.fireSound = c1;
+            if (__instance.fireSound_loop != null && clips.TryGetValue(__instance.fireSound_loop.name + ".wav", out var c2))
+                __instance.fireSound_loop = c2;
+            if (__instance.fireSound_tail != null && clips.TryGetValue(__instance.fireSound_tail.name + ".wav", out var c3))
+                __instance.fireSound_tail = c3;
+            if (__instance.fireSound_start != null && clips.TryGetValue(__instance.fireSound_start.name + ".wav", out var c4))
+                __instance.fireSound_start = c4;
+            if (__instance.fireSound_distance != null && clips.TryGetValue(__instance.fireSound_distance.name + ".wav", out var c5))
+                __instance.fireSound_distance = c5;
+            if (__instance.fireSound_distance_loop != null && clips.TryGetValue(__instance.fireSound_distance_loop.name + ".wav", out var c6))
+                __instance.fireSound_distance_loop = c6;
+            if (__instance.fireSound_distance_tail != null && clips.TryGetValue(__instance.fireSound_distance_tail.name + ".wav", out var c7))
+                __instance.fireSound_distance_tail = c7;
+        }
+    }
+
+    // Patch voice sounds
+    [HarmonyPatch(typeof(VoiceManager), nameof(VoiceManager.GetVoice))]
+    class Patch_GetVoice
+    {
+        static bool Prefix(VoiceManager.VoiceClip clip, int index, ref AudioClip __result)
+        {
+            // TODO: Map VoiceClip enum to the clip arrays and check for replacements
+            // This requires runtime inspection of which clips are assigned to which arrays
+            return true; // run original for now
+        }
+    }
+}
+'''
+
+    csproj = r'''<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <AssemblyName>ER2AudioMod</AssemblyName>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Update these paths to your BepInEx + game install -->
+    <Reference Include="BepInEx.Core">
+      <HintPath>..\..\BepInEx\core\BepInEx.Core.dll</HintPath>
+    </Reference>
+    <Reference Include="BepInEx.Unity.IL2CPP">
+      <HintPath>..\..\BepInEx\core\BepInEx.Unity.IL2CPP.dll</HintPath>
+    </Reference>
+    <Reference Include="HarmonyX">
+      <HintPath>..\..\BepInEx\core\0Harmony.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine">
+      <HintPath>..\..\Easy Red 2_Data\Managed\UnityEngine.dll</HintPath>
+    </Reference>
+    <Reference Include="Assembly-CSharp">
+      <HintPath>..\..\interop\Assembly-CSharp.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+</Project>
+'''
+
+    with open(src_dir / "ER2AudioMod.cs", "w") as f:
+        f.write(plugin_cs)
+    with open(src_dir / "ER2AudioMod.csproj", "w") as f:
+        f.write(csproj)
+    with open(src_dir / "README.txt", "w") as f:
+        f.write("Build this project with: dotnet build -c Release\n"
+                "Then copy ER2AudioMod.dll to BepInEx/plugins/ER2AudioMod/\n"
+                "along with manifest.json and the audio/ folder.\n")
 
 
 # ---------------------------------------------------------------------------
@@ -570,9 +798,11 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/swaps":
             self._send_json(load_swaps())
         elif path == "/api/audioinfo":
-            self._send_json(build_audio_info_cache())
+            self._send_json(_audio_info_cache)
         elif path == "/api/ro2":
             self._send_json(load_ro2_catalogue())
+        elif path == "/api/profiles":
+            self._send_json(list_profiles())
         elif path == "/api/rescan":
             data = scan_from_prefabs()
             save_mapping(data)
@@ -601,6 +831,18 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(self._handle_revert(body))
         elif path == "/api/export":
             self._send_json(export_mod())
+        elif path == "/api/profile/save":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            self._send_json(save_profile(body.get("name", "default")))
+        elif path == "/api/profile/load":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            self._send_json(load_profile(body.get("name", "default")))
+        elif path == "/api/profile/delete":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            self._send_json(delete_profile(body.get("name", "")))
         else:
             self.send_error(404)
 
@@ -739,7 +981,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, fmt, *args):
-        pass
+        import sys
+        sys.stderr.write("%s - %s\n" % (self.client_address[0], fmt % args))
+        sys.stderr.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -861,6 +1105,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
 <div id="main">
   <div id="toolbar">
     <button class="secondary" onclick="rescan()">Rescan</button>
+    <button class="secondary" onclick="showProfiles()">Profiles</button>
     <button onclick="exportMod()">Export Mod</button>
     <input type="text" id="clip-filter" placeholder="Filter by filename or action..."
            oninput="renderEntity(currentEntity)" style="background:#1a1a2e;border:1px solid #0f3460;
@@ -1185,7 +1430,7 @@ function renderEntity(entity) {
       }
 
       if (isSwapped) {
-        html += '<span class="swap-info">swapped</span>' +
+        html += '<span class="swap-info" title="' + esc(customFile) + '">\u2192 ' + esc(customFile) + '</span>' +
           '<audio controls preload="none" onplay="playClip(this)">' +
           '<source src="/custom/' + encodeURIComponent(customFile) + '" type="' + mime + '">' +
           '</audio>';
@@ -1373,6 +1618,66 @@ async function revertSwap(original) {
   await reloadAll();
 }
 
+async function showProfiles() {
+  var profiles = await (await fetch('/api/profiles')).json();
+  var swapCount = Object.keys(swaps).length;
+  var root = document.getElementById('modal-root');
+
+  var listHtml = '';
+  if (profiles.length === 0) {
+    listHtml = '<p style="color:#888;padding:8px;">No saved profiles yet.</p>';
+  } else {
+    for (var i = 0; i < profiles.length; i++) {
+      listHtml += '<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 8px;border-bottom:1px solid #0f3460;">' +
+        '<span style="font-size:13px;">' + esc(profiles[i]) + '</span>' +
+        '<div style="display:flex;gap:4px;">' +
+        '<button class="btn-ok" style="padding:3px 10px;font-size:11px;" onclick="doLoadProfile(\'' + escAttr(profiles[i]) + '\')">Load</button>' +
+        '<button class="btn-cancel" style="padding:3px 10px;font-size:11px;" onclick="doDeleteProfile(\'' + escAttr(profiles[i]) + '\')">Delete</button>' +
+        '</div></div>';
+    }
+  }
+
+  root.innerHTML = '<div class="modal-bg" onclick="if(event.target===this)closeModal()">' +
+    '<div class="modal" style="max-width:500px;">' +
+    '<h3>Profiles</h3>' +
+    '<p style="font-size:12px;color:#888;margin-bottom:12px;">Current session: ' + swapCount + ' swaps</p>' +
+    '<div style="display:flex;gap:8px;margin-bottom:16px;">' +
+    '<input type="text" id="profile-name" placeholder="Profile name..." style="flex:1;">' +
+    '<button class="btn-ok" onclick="doSaveProfile()">Save Current</button>' +
+    '</div>' +
+    '<div style="max-height:300px;overflow-y:auto;">' + listHtml + '</div>' +
+    '<div class="btn-row" style="margin-top:12px;"><button class="btn-cancel" onclick="closeModal()">Close</button></div>' +
+    '</div></div>';
+}
+
+async function doSaveProfile() {
+  var name = document.getElementById('profile-name').value.trim();
+  if (!name) return;
+  var res = await fetch('/api/profile/save', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name: name})
+  });
+  var result = await res.json();
+  if (result.ok) showProfiles();
+}
+
+async function doLoadProfile(name) {
+  await fetch('/api/profile/load', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name: name})
+  });
+  closeModal();
+  await reloadAll();
+}
+
+async function doDeleteProfile(name) {
+  await fetch('/api/profile/delete', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name: name})
+  });
+  showProfiles();
+}
+
 async function exportMod() {
   var res = await fetch('/api/export', { method: 'POST' });
   var result = await res.json();
@@ -1382,8 +1687,9 @@ async function exportMod() {
       '<div class="modal">' +
       '<h3>Mod Exported</h3>' +
       '<p style="margin-bottom:12px;">' + result.swaps + ' swaps exported, ' + result.files + ' audio files.</p>' +
-      '<p style="font-size:12px;color:#888;margin-bottom:16px;">Output: <code>' + esc(result.path) + '</code></p>' +
-      '<p style="font-size:12px;color:#888;margin-bottom:16px;">Copy the <code>BepInEx</code> folder into your Easy Red 2 install directory.</p>' +
+      '<p style="font-size:12px;color:#888;margin-bottom:8px;">Output: <code>' + esc(result.path) + '</code></p>' +
+      '<p style="font-size:12px;color:#888;margin-bottom:8px;">1. Build the plugin: <code>cd src &amp;&amp; dotnet build -c Release</code></p>' +
+      '<p style="font-size:12px;color:#888;margin-bottom:16px;">2. Copy <code>ER2AudioMod.dll</code> + <code>manifest.json</code> + <code>audio/</code> into <code>BepInEx/plugins/ER2AudioMod/</code></p>' +
       '<div class="btn-row"><button class="btn-ok" onclick="closeModal()">OK</button></div>' +
       '</div></div>';
   } else {
@@ -1415,15 +1721,36 @@ init();
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print(f"Building mapping from prefabs in {VOICES_DIR}...")
-    print(f"Audio files in {AUDIO_DIR}")
+    import time
+
+    print(f"[1/4] Building ER2 mapping from prefabs...")
+    t0 = time.time()
     mapping_data = load_mapping()
     voices = mapping_data.get("voices", {})
     total = sum(len(clips) for ent in voices.values() for clips in ent.values())
-    assigned = total - len(voices.get("Uncategorised", {}).get("misc", []))
     uncat = len(voices.get("Uncategorised", {}).get("misc", []))
-    print(f"Found {len(voices) - (1 if 'Uncategorised' in voices else 0)} voice sets, "
-          f"{assigned} assigned clips, {uncat} uncategorised")
+    print(f"      {len(voices)} entities, {total} clips ({time.time()-t0:.1f}s)")
+
+    print(f"[2/4] Building cross-references...")
+    t0 = time.time()
+    _refs = build_refs(mapping_data)
+    shared = sum(1 for v in _refs.values() if len(v) > 1)
+    print(f"      {len(_refs)} clips, {shared} shared ({time.time()-t0:.1f}s)")
+
+    print(f"[3/4] Scanning RO2/RS catalogue...")
+    t0 = time.time()
+    _ro2 = load_ro2_catalogue()
+    ro2_total = sum(
+        sum(len(c) for c in item.get("actions", {}).values()) + len(item.get("clips", []))
+        for cats in _ro2.values() for items in cats.values() for item in items.values()
+    )
+    print(f"      {ro2_total} RO2/RS clips ({time.time()-t0:.1f}s)")
+
+    print(f"[4/4] Building audio info cache...")
+    t0 = time.time()
+    _audio_info_cache = build_audio_info_cache()
+    print(f"      {len(_audio_info_cache)} files scanned ({time.time()-t0:.1f}s)")
+
     print(f"\nStarting server at http://localhost:{PORT}")
 
     class ReusableHTTPServer(HTTPServer):
