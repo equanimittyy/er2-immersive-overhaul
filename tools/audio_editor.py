@@ -23,6 +23,7 @@ RO2_DIR = DATA_DIR / "RO2-RS"
 MAPPING_FILE = DATA_DIR / "audio_mapping.json"
 RO2_CATALOGUE_FILE = DATA_DIR / "ro2_catalogue.json"
 SWAPS_FILE = DATA_DIR / "swaps.json"
+SWAP_SOURCES_FILE = DATA_DIR / "swap_sources.json"
 CONFIG_FILE = DATA_DIR / "config.json"
 PORT = 8420
 _audio_info_cache = {}  # populated at startup
@@ -524,6 +525,19 @@ def save_swaps(swaps):
     SWAPS_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(SWAPS_FILE, "w") as f:
         json.dump(swaps, f, indent=2)
+
+
+def load_swap_sources():
+    if SWAP_SOURCES_FILE.exists():
+        with open(SWAP_SOURCES_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def save_swap_sources(sources):
+    SWAP_SOURCES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(SWAP_SOURCES_FILE, "w") as f:
+        json.dump(sources, f, indent=2)
 
 
 PROFILES_DIR = DATA_DIR / "profiles"
@@ -1238,6 +1252,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(build_refs(data))
         elif path == "/api/swaps":
             self._send_json(load_swaps())
+        elif path == "/api/swap-sources":
+            self._send_json(load_swap_sources())
         elif path == "/api/audioinfo":
             self._send_json(_audio_info_cache)
         elif path == "/api/ro2":
@@ -1374,6 +1390,11 @@ class Handler(BaseHTTPRequestHandler):
         swaps = load_swaps()
         swaps[original] = custom_name
         save_swaps(swaps)
+
+        sources = load_swap_sources()
+        sources[original] = ro2_path
+        save_swap_sources(sources)
+
         return {"ok": True, "original": original, "custom": custom_name}
 
     def _handle_revert(self, body):
@@ -1385,6 +1406,10 @@ class Handler(BaseHTTPRequestHandler):
         swaps = load_swaps()
         custom_name = swaps.pop(original, None)
         save_swaps(swaps)
+
+        sources = load_swap_sources()
+        sources.pop(original, None)
+        save_swap_sources(sources)
 
         # Delete custom file
         if custom_name:
@@ -1582,6 +1607,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
 let data = null;
 let refs = {};
 let swaps = {};
+let swapSources = {};
 let audioInfo = {};
 let ro2 = {};
 let ro2Index = [];  // flat searchable list
@@ -1654,8 +1680,9 @@ async function init() {
     fetch('/api/swaps').then(function(r) { return r.json(); }),
     fetch('/api/audioinfo').then(function(r) { return r.json(); }),
     fetch('/api/ro2').then(function(r) { return r.json(); }),
+    fetch('/api/swap-sources').then(function(r) { return r.json(); }),
   ]);
-  data = results[0]; refs = results[1]; swaps = results[2]; audioInfo = results[3]; ro2 = results[4];
+  data = results[0]; refs = results[1]; swaps = results[2]; audioInfo = results[3]; ro2 = results[4]; swapSources = results[5];
   buildRO2Index();
   renderTabs();
   renderSidebar();
@@ -1824,8 +1851,9 @@ async function reloadAll() {
     fetch('/api/mapping').then(function(r) { return r.json(); }),
     fetch('/api/refs').then(function(r) { return r.json(); }),
     fetch('/api/swaps').then(function(r) { return r.json(); }),
+    fetch('/api/swap-sources').then(function(r) { return r.json(); }),
   ]);
-  data = results[0]; refs = results[1]; swaps = results[2];
+  data = results[0]; refs = results[1]; swaps = results[2]; swapSources = results[3];
   renderTabs();
   renderSidebar();
   updateStats();
@@ -1943,7 +1971,9 @@ function renderEntity(entity) {
       }
 
       if (isSwapped) {
-        html += '<span class="swap-info" title="' + esc(customFile) + '">\u2192 ' + esc(customFile) + '</span>' +
+        var sourceLabel = swapSources[clip] ? swapSources[clip].split('/').pop() : customFile;
+        var sourceTitle = swapSources[clip] || customFile;
+        html += '<span class="swap-info" title="' + esc(sourceTitle) + '">\u2192 ' + esc(sourceLabel) + '</span>' +
           '<audio controls preload="none" onplay="playClip(this)">' +
           '<source src="/custom/' + encodeURIComponent(customFile) + '" type="' + mime + '">' +
           '</audio>';
