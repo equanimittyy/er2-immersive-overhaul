@@ -591,6 +591,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/swap":
             self._handle_swap()
+        elif path == "/api/swap/ro2":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            self._send_json(self._handle_swap_ro2(body))
         elif path == "/api/swap/revert":
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
@@ -652,6 +656,27 @@ class Handler(BaseHTTPRequestHandler):
         save_swaps(swaps)
 
         self._send_json({"ok": True, "original": original, "custom": custom_name})
+
+    def _handle_swap_ro2(self, body):
+        """Swap an ER2 clip with an RO2 clip by copying it to custom/."""
+        import shutil
+        original = body.get("original")
+        ro2_path = body.get("ro2_path")  # relative to RO2_DIR
+        if not original or not ro2_path:
+            return {"ok": False, "error": "Missing original or ro2_path"}
+
+        src = RO2_DIR / ro2_path
+        if not src.exists():
+            return {"ok": False, "error": "RO2 file not found"}
+
+        CUSTOM_DIR.mkdir(parents=True, exist_ok=True)
+        custom_name = Path(original).stem + "_ro2" + src.suffix
+        shutil.copy2(src, CUSTOM_DIR / custom_name)
+
+        swaps = load_swaps()
+        swaps[original] = custom_name
+        save_swaps(swaps)
+        return {"ok": True, "original": original, "custom": custom_name}
 
     def _handle_revert(self, body):
         """Revert a swap back to original."""
@@ -789,11 +814,26 @@ PAGE_HTML = r"""<!DOCTYPE html>
   .ref-list { font-size: 11px; color: #888; max-height: 200px; overflow-y: auto;
               margin: 8px 0 16px; padding: 8px; background: #1a1a2e; border-radius: 4px; }
   .ref-list div { padding: 2px 0; }
+  .ro2-results { flex: 1; overflow-y: auto; max-height: 400px; margin: 8px 0; }
+  .ro2-item { display: flex; align-items: center; gap: 8px; padding: 6px 8px;
+              border-bottom: 1px solid #0f3460; font-size: 12px; }
+  .ro2-item:hover { background: #0f3460; }
+  .ro2-item .ro2-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+                        white-space: nowrap; }
+  .ro2-item .ro2-meta { color: #888; font-size: 10px; white-space: nowrap; }
+  .ro2-item audio { height: 24px; width: 160px; flex-shrink: 0; }
+  .ro2-item button { background: #e94560; border: none; color: white; padding: 3px 10px;
+                     border-radius: 3px; cursor: pointer; font-size: 11px; flex-shrink: 0; }
+  .ro2-tabs { display: flex; gap: 4px; margin-bottom: 8px; }
+  .ro2-tabs button { background: #0f3460; border: none; color: #888; padding: 4px 10px;
+                     border-radius: 3px; cursor: pointer; font-size: 11px; }
+  .ro2-tabs button.active { background: #e94560; color: white; }
 
   .modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex;
               align-items: center; justify-content: center; z-index: 100; }
   .modal { background: #16213e; border: 1px solid #0f3460; border-radius: 8px;
-           padding: 24px; min-width: 400px; }
+           padding: 24px; min-width: 400px; max-width: 800px; width: 90%; max-height: 90vh;
+           display: flex; flex-direction: column; }
   .modal h3 { margin-bottom: 16px; color: #e94560; }
   .modal label { display: block; margin-bottom: 4px; font-size: 12px; color: #888; }
   .modal input { width: 100%; background: #1a1a2e; border: 1px solid #0f3460;
@@ -839,6 +879,8 @@ let data = null;
 let refs = {};
 let swaps = {};
 let audioInfo = {};
+let ro2 = {};
+let ro2Index = [];  // flat searchable list
 let currentEntity = null;
 let currentAudio = null;
 let currentTab = 0;
@@ -902,11 +944,138 @@ async function init() {
     fetch('/api/refs').then(function(r) { return r.json(); }),
     fetch('/api/swaps').then(function(r) { return r.json(); }),
     fetch('/api/audioinfo').then(function(r) { return r.json(); }),
+    fetch('/api/ro2').then(function(r) { return r.json(); }),
   ]);
-  data = results[0]; refs = results[1]; swaps = results[2]; audioInfo = results[3];
+  data = results[0]; refs = results[1]; swaps = results[2]; audioInfo = results[3]; ro2 = results[4];
+  buildRO2Index();
   renderTabs();
   renderSidebar();
   updateStats();
+}
+
+// Keyword map: ER2 action -> search terms for RO2 matching
+var ACTION_KEYWORDS = {
+  iVeBeenHit:'hurt wounded hit', gotHit:'hurt wounded hit', medic:'bandaging medic hurt',
+  imReloading:'reloading', imUnderFire:'takingfire suppressed', AAAAAH:'dying scream',
+  scream_long:'dying slow scream', yes:'confirm', yesSir:'confirm', watchYourFire:'friendlyfire',
+  enemyInfantrySpotted:'infantryspotted spotted', enemyTankSpotted:'tankspotted spotted',
+  enemyArtillerySpotted:'incomingarty artillery', enemyDown:'enemydeath killed',
+  granade:'grenade throwing', thankYou:'thanks', coveringFire:'suppressing fire',
+  imMoving:'moveto', imCharging:'charging', iSurrender:'', imTakingTheLead:'',
+  moveThere:'moveto', attackThere:'attackobj attack', charge:'charging',
+  attackThatTank:'attackvehicle tank', attackThatVehicle:'attackvehicle vehicle',
+  followMe:'followme', letsSpreadOut:'', lineFormation:'', columnFormation:'',
+  timeToRetreat:'retreat', getOut:'bailout getout', getIn:'',
+  letsMoveTank:'forward tank', fireTank:'fire tank', gunReloadedTank:'',
+  enemyHittedTank:'enemytankdeath hit', enemyDestroyedtank:'enemytankdeath destroyed',
+  enemyMissedTank:'', enemyNotPenetratedTank:'',
+  gotHitTank:'hit tank', radiomanIsDead:'', gunnerIsDead:'gunnerdead',
+  commanderIsDead:'commanderdead', driverIsDead:'driverdead',
+  illTakeHisSeat:'', getOutTankOnFire:'bailout fire', getOutTankDestroyed:'bailout destroyed',
+  numbers:'', artillerySupportAt:'requestarty callingarty', tankSupportRequest:'requestsupport tank',
+  fireSound:'fire single', fireSound_start:'fire start loop', fireSound_loop:'fire loop',
+  fireSound_tail:'fire tail end', fireSound_distance:'fire distant',
+  fireSound_distance_loop:'fire distant loop', fireSound_distance_tail:'fire distant tail',
+  reload_sound_full:'reload', reload_sound_half:'reload', chamber_sound:'chamber bolt',
+  boltaction_sound:'bolt action', engine_start:'engine start', engine_move:'engine move',
+  engine_stop:'engine stop', crashSound:'crash impact',
+};
+
+function tokenize(s) {
+  return s.toLowerCase().replace(/[^a-z0-9]/g,' ').split(/\s+/).filter(function(t){return t.length>1;});
+}
+
+function buildRO2Index() {
+  ro2Index = [];
+  for (var game in ro2) {
+    var cats = ro2[game];
+    // voices
+    for (var vid in (cats.voices||{})) {
+      var voice = cats.voices[vid];
+      for (var action in voice.actions) {
+        var clips = voice.actions[action];
+        for (var i=0; i<clips.length; i++) {
+          ro2Index.push({
+            path: clips[i],
+            game: game,
+            category: 'voice',
+            entity: vid,
+            action: action,
+            faction: voice.faction,
+            language: voice.language,
+            vtype: voice.type,
+            tokens: tokenize(action + ' ' + voice.faction + ' ' + voice.type + ' ' + vid),
+          });
+        }
+      }
+    }
+    // weapons
+    for (var wid in (cats.weapons||{})) {
+      var w = cats.weapons[wid];
+      var wclips = w.clips||[];
+      for (var i=0; i<wclips.length; i++) {
+        var fname = wclips[i].split('/').pop().replace(/\.\w+$/,'');
+        ro2Index.push({
+          path: wclips[i],
+          game: game,
+          category: 'weapon',
+          entity: wid,
+          action: fname,
+          faction: '',
+          language: '',
+          vtype: w.type,
+          tokens: tokenize(fname + ' ' + wid + ' ' + w.type),
+        });
+      }
+    }
+    // vehicles
+    for (var vid2 in (cats.vehicles||{})) {
+      var veh = cats.vehicles[vid2];
+      var vclips = veh.clips||[];
+      for (var i=0; i<vclips.length; i++) {
+        var fname2 = vclips[i].split('/').pop().replace(/\.\w+$/,'');
+        ro2Index.push({
+          path: vclips[i],
+          game: game,
+          category: 'vehicle',
+          entity: vid2,
+          action: fname2,
+          faction: '',
+          language: '',
+          vtype: '',
+          tokens: tokenize(fname2 + ' ' + vid2),
+        });
+      }
+    }
+  }
+}
+
+function scoreRO2(item, entity, action, clip) {
+  var score = 0;
+  // Action keyword matching
+  var kw = ACTION_KEYWORDS[action] || '';
+  var searchTerms = tokenize(action + ' ' + kw);
+  for (var i=0; i<searchTerms.length; i++) {
+    for (var j=0; j<item.tokens.length; j++) {
+      if (item.tokens[j].indexOf(searchTerms[i]) !== -1 || searchTerms[i].indexOf(item.tokens[j]) !== -1) {
+        score += 10;
+      }
+    }
+  }
+  // Faction matching from entity name
+  var el = entity.toLowerCase();
+  if (item.faction) {
+    var fl = item.faction.toLowerCase();
+    if (el.indexOf(fl.substr(0,3)) !== -1) score += 20;
+  }
+  // Category matching: voice entity -> voice clips, weapon -> weapon clips
+  if (el.indexOf('voice') !== -1 && item.category === 'voice') score += 5;
+  if (item.category === 'weapon' && (action.indexOf('fire') !== -1 || action.indexOf('reload') !== -1)) score += 5;
+  if (item.category === 'vehicle' && (action.indexOf('engine') !== -1 || action.indexOf('crash') !== -1)) score += 5;
+  // Type matching: tank voice -> tank clips
+  if (el.indexOf('tank') !== -1 && item.vtype === 'tank') score += 15;
+  if (action.indexOf('Tank') !== -1 && item.vtype === 'tank') score += 10;
+  return score;
 }
 
 async function reloadAll() {
@@ -1030,7 +1199,7 @@ function renderEntity(entity) {
       if (isSwapped) {
         html += '<button onclick="revertSwap(\'' + escAttr(clip) + '\')">Revert</button>';
       }
-      html += '<button onclick="swapClip(\'' + escAttr(clip) + '\')">Swap</button>' +
+      html += '<button onclick="swapClip(\'' + escAttr(clip) + '\',\'' + escAttr(entity) + '\',\'' + escAttr(action) + '\')">Swap</button>' +
         '</div></div>';
     }
     html += '</div></div>';
@@ -1060,55 +1229,136 @@ function showRefs(clip) {
   root.innerHTML = html;
 }
 
-function swapClip(original) {
+var _swapCtx = {};
+
+function swapClip(original, entity, action) {
+  _swapCtx = { original: original, entity: entity || '', action: action || '' };
   var clipRefs = refs[original] || [];
   var root = document.getElementById('modal-root');
 
   var refHtml = '';
   if (clipRefs.length > 1) {
-    refHtml = '<div style="margin-bottom:12px;"><span class="badge warn">' + clipRefs.length + ' references</span>' +
-      ' Swapping this file will affect:</div>' +
-      '<div class="ref-list">';
-    for (var i = 0; i < clipRefs.length; i++) {
-      refHtml += '<div>' + esc(clipRefs[i].entity) + ' / ' + esc(clipRefs[i].action) + '</div>';
-    }
-    refHtml += '</div>';
+    refHtml = '<div style="margin-bottom:8px;"><span class="badge warn">' + clipRefs.length + ' references</span>' +
+      ' Swapping this file affects ' + clipRefs.length + ' entities</div>';
   }
 
   root.innerHTML = '<div class="modal-bg" onclick="if(event.target===this)closeModal()">' +
     '<div class="modal">' +
-    '<h3>Swap Audio Clip</h3>' +
-    '<p style="font-size:12px;color:#888;margin-bottom:12px;">' + esc(original) + '</p>' +
+    '<h3>Swap: ' + esc(original) + '</h3>' +
     refHtml +
-    '<label>Original</label>' +
-    '<audio controls preload="none" style="width:100%;height:32px;margin-bottom:12px;">' +
-    '<source src="/audio/' + encodeURIComponent(original) + '"></audio>' +
-    '<label>Replacement file (.wav / .ogg)</label>' +
-    '<input type="file" id="swap-file" accept=".wav,.ogg,.mp3" style="margin-bottom:12px;font-size:12px;">' +
-    '<div id="swap-preview"></div>' +
-    '<div class="btn-row">' +
+    '<div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;">' +
+    '<span style="font-size:11px;color:#888;">Original:</span>' +
+    '<audio controls preload="none" style="height:28px;flex:1;"><source src="/audio/' + encodeURIComponent(original) + '"></audio>' +
+    '</div>' +
+    '<div class="ro2-tabs">' +
+    '<button class="active" onclick="swapTabRO2()">RO2 / Rising Storm</button>' +
+    '<button onclick="swapTabFile()">Upload File</button>' +
+    '</div>' +
+    '<div id="swap-content"></div>' +
+    '<div class="btn-row" style="margin-top:8px;">' +
     '<button class="btn-cancel" onclick="closeModal()">Cancel</button>' +
-    '<button class="btn-ok" onclick="doSwap(\'' + escAttr(original) + '\')">Swap</button>' +
     '</div></div></div>';
 
+  swapTabRO2();
+}
+
+function swapTabRO2() {
+  var tabs = document.querySelectorAll('.ro2-tabs button');
+  tabs[0].className = 'active'; tabs[1].className = '';
+  var sc = document.getElementById('swap-content');
+  sc.innerHTML =
+    '<input type="text" id="ro2-search" placeholder="Search RO2 clips..." ' +
+    'oninput="renderRO2Results()" style="width:100%;background:#1a1a2e;border:1px solid #0f3460;' +
+    'color:#e0e0e0;padding:6px 10px;border-radius:4px;font-size:12px;margin-bottom:4px;">' +
+    '<div class="ro2-results" id="ro2-results"></div>';
+  renderRO2Results();
+}
+
+function swapTabFile() {
+  var tabs = document.querySelectorAll('.ro2-tabs button');
+  tabs[0].className = ''; tabs[1].className = 'active';
+  var sc = document.getElementById('swap-content');
+  sc.innerHTML =
+    '<label>Replacement file (.wav / .ogg)</label>' +
+    '<input type="file" id="swap-file" accept=".wav,.ogg,.mp3" style="margin-bottom:8px;font-size:12px;">' +
+    '<div id="swap-preview"></div>' +
+    '<div class="btn-row" style="margin-top:8px;">' +
+    '<button class="btn-ok" onclick="doSwapFile()">Swap with file</button></div>';
   document.getElementById('swap-file').addEventListener('change', function(e) {
     var file = e.target.files[0];
     if (file) {
       var url = URL.createObjectURL(file);
       document.getElementById('swap-preview').innerHTML =
-        '<label>Preview</label><audio controls style="width:100%;height:32px;margin-bottom:12px;"><source src="' + url + '"></audio>';
+        '<audio controls style="width:100%;height:32px;margin-bottom:8px;"><source src="' + url + '"></audio>';
     }
   });
 }
 
-async function doSwap(original) {
+function renderRO2Results() {
+  var query = (document.getElementById('ro2-search') || {}).value || '';
+  var queryTokens = tokenize(query);
+  var entity = _swapCtx.entity;
+  var action = _swapCtx.action;
+  var original = _swapCtx.original;
+
+  // Score and sort
+  var scored = [];
+  for (var i = 0; i < ro2Index.length; i++) {
+    var item = ro2Index[i];
+    var s = scoreRO2(item, entity, action, original);
+    // Apply search filter
+    if (queryTokens.length > 0) {
+      var matched = 0;
+      for (var q = 0; q < queryTokens.length; q++) {
+        for (var t = 0; t < item.tokens.length; t++) {
+          if (item.tokens[t].indexOf(queryTokens[q]) !== -1) { matched++; break; }
+        }
+      }
+      if (matched === 0) continue;
+      s += matched * 15;
+    }
+    if (s > 0 || queryTokens.length > 0) scored.push({ item: item, score: s });
+  }
+
+  scored.sort(function(a, b) { return b.score - a.score; });
+  var results = scored.slice(0, 50);
+
+  var container = document.getElementById('ro2-results');
+  if (!results.length) {
+    container.innerHTML = '<p style="color:#888;padding:12px;">No matches. Try different search terms.</p>';
+    return;
+  }
+  var html = '';
+  for (var j = 0; j < results.length; j++) {
+    var it = results[j].item;
+    var fname = it.path.split('/').pop();
+    var meta = it.game + ' \u00b7 ' + it.category + ' \u00b7 ' + it.entity;
+    html += '<div class="ro2-item">' +
+      '<span class="ro2-name" title="' + esc(it.path) + '">' + esc(fname) + '</span>' +
+      '<span class="ro2-meta">' + esc(meta) + '</span>' +
+      '<audio controls preload="none" onplay="playClip(this)"><source src="/ro2audio/' + encodeURIComponent(it.path) + '" type="audio/ogg"></audio>' +
+      '<button onclick="doSwapRO2(\'' + escAttr(it.path) + '\')">Use</button>' +
+      '</div>';
+  }
+  container.innerHTML = html;
+}
+
+async function doSwapRO2(ro2Path) {
+  await fetch('/api/swap/ro2', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ original: _swapCtx.original, ro2_path: ro2Path })
+  });
+  closeModal();
+  await reloadAll();
+}
+
+async function doSwapFile() {
   var fileInput = document.getElementById('swap-file');
   if (!fileInput.files.length) return;
-
   var formData = new FormData();
-  formData.append('original', original);
+  formData.append('original', _swapCtx.original);
   formData.append('file', fileInput.files[0]);
-
   await fetch('/api/swap', { method: 'POST', body: formData });
   closeModal();
   await reloadAll();
