@@ -770,7 +770,7 @@ def _normalize_peak_wav(filepath, target_peak=0.95):
     peak = _wav_peak(filepath)
     if peak and peak > 0:
         gain = target_peak / peak
-        if gain > 1.05:  # only boost, don't attenuate
+        if abs(gain - 1.0) > 0.05:  # adjust if >5% off target
             _apply_gain_wav(filepath, gain)
             return True
     return False
@@ -884,29 +884,10 @@ def export_mod():
 
         clip_refs = refs_data.get(original, [])
 
-        # Determine if this is a weapon or voice clip from references
-        is_weapon = any(r.get("action", "").startswith("fire") or
-                        r.get("action", "").startswith("reload") or
-                        r.get("action", "").startswith("chamber") or
-                        r.get("action", "").startswith("bolt") or
-                        not r.get("entity", "").startswith("Voice")
-                        for r in clip_refs) if clip_refs else True
-
-        if is_weapon:
-            # Weapons: peak normalize to -0.4dB for maximum punch
-            if _normalize_peak_wav(dst):
-                equalized += 1
-        else:
-            # Voices: RMS match to original for natural blending
-            original_path = AUDIO_DIR / original
-            if original_path.exists():
-                orig_rms = _audio_rms(original_path)
-                repl_rms = _wav_rms(dst)
-                if orig_rms and repl_rms:
-                    gain = orig_rms / repl_rms
-                    if abs(gain - 1.0) > 0.05:
-                        _apply_gain_wav(dst, gain)
-                        equalized += 1
+        # Peak normalize all clips to 95% (-0.4dB)
+        # Game controls playback volume via AudioSource — clips should be as hot as possible
+        if _normalize_peak_wav(dst):
+            equalized += 1
 
         manifest[original] = {
             "replacement": export_name,
