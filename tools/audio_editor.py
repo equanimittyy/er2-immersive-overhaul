@@ -695,9 +695,11 @@ namespace ER2AudioMod
         internal static string PluginDir;
         internal static Dictionary<string, AudioClip> ReplacementClips = new();
         internal static Dictionary<string, string> Manifest = new();
+        internal new static BepInEx.Logging.ManualLogSource Log;
 
         public override void Load()
         {
+            Log = base.Log;
             PluginDir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
             LoadManifest();
             LoadAudioClips();
@@ -1726,14 +1728,38 @@ function swapClip(original, entity, action) {
   swapTabRO2();
 }
 
+function getRO2VoiceActors() {
+  var actors = {};
+  for (var i = 0; i < ro2Index.length; i++) {
+    var item = ro2Index[i];
+    if (item.category === 'voice') {
+      var label = item.entity + ' (' + item.game + (item.faction ? ' \u00b7 ' + item.faction : '') + ')';
+      actors[item.game + '/' + item.entity] = label;
+    }
+  }
+  var sorted = Object.keys(actors).sort();
+  return sorted.map(function(k) { return { key: k, label: actors[k] }; });
+}
+
 function swapTabRO2() {
   var tabs = document.querySelectorAll('.ro2-tabs button');
   tabs[0].className = 'active'; tabs[1].className = '';
   var sc = document.getElementById('swap-content');
+  var actors = getRO2VoiceActors();
+  var filterHtml = '<select id="ro2-voice-filter" onchange="renderRO2Results()" ' +
+    'style="background:#1a1a2e;border:1px solid #0f3460;color:#e0e0e0;padding:6px 10px;' +
+    'border-radius:4px;font-size:12px;flex:1;min-width:0;">' +
+    '<option value="">All voice actors</option>';
+  for (var i = 0; i < actors.length; i++) {
+    filterHtml += '<option value="' + escAttr(actors[i].key) + '">' + esc(actors[i].label) + '</option>';
+  }
+  filterHtml += '</select>';
   sc.innerHTML =
+    '<div style="display:flex;gap:6px;margin-bottom:4px;">' +
     '<input type="text" id="ro2-search" placeholder="Search RO2 clips..." ' +
-    'oninput="renderRO2Results()" style="width:100%;background:#1a1a2e;border:1px solid #0f3460;' +
-    'color:#e0e0e0;padding:6px 10px;border-radius:4px;font-size:12px;margin-bottom:4px;">' +
+    'oninput="renderRO2Results()" style="flex:1;background:#1a1a2e;border:1px solid #0f3460;' +
+    'color:#e0e0e0;padding:6px 10px;border-radius:4px;font-size:12px;">' +
+    filterHtml + '</div>' +
     '<div class="ro2-results" id="ro2-results"></div>';
   renderRO2Results();
 }
@@ -1761,6 +1787,7 @@ function swapTabFile() {
 function renderRO2Results() {
   var query = (document.getElementById('ro2-search') || {}).value || '';
   var queryTokens = tokenize(query);
+  var voiceFilter = (document.getElementById('ro2-voice-filter') || {}).value || '';
   var entity = _swapCtx.entity;
   var action = _swapCtx.action;
   var original = _swapCtx.original;
@@ -1769,6 +1796,8 @@ function renderRO2Results() {
   var scored = [];
   for (var i = 0; i < ro2Index.length; i++) {
     var item = ro2Index[i];
+    // Apply voice actor filter
+    if (voiceFilter && (item.category !== 'voice' || (item.game + '/' + item.entity) !== voiceFilter)) continue;
     var s = scoreRO2(item, entity, action, original);
     // Apply search filter
     if (queryTokens.length > 0) {
@@ -1781,7 +1810,7 @@ function renderRO2Results() {
       if (matched === 0) continue;
       s += matched * 15;
     }
-    if (s > 0 || queryTokens.length > 0) scored.push({ item: item, score: s });
+    if (s > 0 || queryTokens.length > 0 || voiceFilter) scored.push({ item: item, score: s });
   }
 
   scored.sort(function(a, b) { return b.score - a.score; });
