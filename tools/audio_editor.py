@@ -18,7 +18,11 @@ AUDIO_DIR = DATA_DIR / "AudioClip"
 VOICES_DIR = DATA_DIR / "voices"
 WEAPONS_DIR = DATA_DIR / "weapons"
 VEHICLES_DIR = DATA_DIR / "vehicles"
+CUSTOM_DIR = DATA_DIR / "custom"
+RO2_DIR = DATA_DIR / "RO2-RS"
 MAPPING_FILE = DATA_DIR / "audio_mapping.json"
+RO2_CATALOGUE_FILE = DATA_DIR / "ro2_catalogue.json"
+SWAPS_FILE = DATA_DIR / "swaps.json"
 PORT = 8420
 
 # GenericGun audio fields
@@ -260,6 +264,294 @@ def save_mapping(data):
         json.dump(data, f, indent=2)
 
 
+def build_refs(data):
+    """Build reverse index: filename -> [(entity, action), ...]."""
+    refs = {}
+    for entity, actions in data.get("voices", {}).items():
+        for action, clips in actions.items():
+            for clip in clips:
+                refs.setdefault(clip, []).append({"entity": entity, "action": action})
+    return refs
+
+
+def get_audio_info(filepath):
+    """Get audio metadata from a WAV or OGG file."""
+    import struct, wave
+    info = {"size": filepath.stat().st_size}
+    ext = filepath.suffix.lower()
+
+    if ext == ".wav":
+        try:
+            with wave.open(str(filepath), "rb") as w:
+                info["channels"] = w.getnchannels()
+                info["sample_rate"] = w.getframerate()
+                info["bit_depth"] = w.getsampwidth() * 8
+                info["duration"] = round(w.getnframes() / w.getframerate(), 2)
+        except Exception:
+            pass
+    elif ext == ".ogg":
+        try:
+            with open(filepath, "rb") as f:
+                data = f.read(200)
+            idx = data.find(b"\x01vorbis")
+            if idx >= 0:
+                offset = idx + 7
+                info["channels"] = struct.unpack_from("<B", data, offset + 4)[0]
+                info["sample_rate"] = struct.unpack_from("<I", data, offset + 5)[0]
+        except Exception:
+            pass
+
+    return info
+
+
+def build_audio_info_cache():
+    """Build info for all audio clips."""
+    cache = {}
+    for f in AUDIO_DIR.iterdir():
+        if f.is_file() and f.suffix in (".wav", ".ogg"):
+            cache[f.name] = get_audio_info(f)
+    return cache
+
+
+def scan_ro2_catalogue():
+    """Scan RO2-RS audio files and build a structured catalogue.
+
+    Structure:
+    {
+      "game": "RO2" or "RS",
+      "categories": {
+        "voices": {
+          "GerNative_01": {         # voice identity
+            "faction": "German",
+            "language": "Native",
+            "type": "infantry",     # infantry or tank
+            "actions": {
+              "Inf_AttackGeneric": ["path/to/file.ogg", ...],
+              ...
+            }
+          }, ...
+        },
+        "weapons": {
+          "Rifle_Kar98": {
+            "type": "Rifle",
+            "clips": ["path/to/file.ogg", ...]
+          }, ...
+        },
+        "vehicles": { ... },
+        "explosions": { ... },
+        "environment": { ... },
+        "character": { ... },
+        "other": { ... }
+      }
+    }
+    """
+    if not RO2_DIR.exists():
+        return {}
+
+    catalogue = {}
+
+    for game_dir in sorted(RO2_DIR.iterdir()):
+        if not game_dir.is_dir():
+            continue
+        game = game_dir.name  # "RO2" or "RS"
+        categories = {
+            "voices": {},
+            "weapons": {},
+            "vehicles": {},
+            "explosions": {},
+            "environment": {},
+            "character": {},
+            "other": {},
+        }
+
+        for folder in sorted(game_dir.iterdir()):
+            if not folder.is_dir():
+                continue
+            name = folder.name
+            files = sorted(str(f.relative_to(RO2_DIR))
+                          for f in folder.rglob("*.ogg"))
+            if not files:
+                continue
+
+            # Voice folders: AUD_VOX_Chatter_* or AUD_RS_VOX_Chatter_*
+            if "_VOX_Chatter_" in name:
+                # Parse voice identity from folder name
+                # RO2: AUD_VOX_Chatter_GerNative_01 / AUD_VOX_Chatter_Tank_GerGer_02
+                # RS:  AUD_RS_VOX_Chatter_Eng_01 / AUD_RS_VOX_Chatter_Jap_03
+                parts = name.split("Chatter_")[1]  # e.g. "GerNative_01" or "Tank_GerGer_02"
+                is_tank = parts.startswith("Tank_")
+                if is_tank:
+                    parts = parts[5:]  # strip "Tank_"
+
+                # Split into identity: everything up to last _NN
+                identity_parts = parts.rsplit("_", 1)
+                voice_id = parts
+                voice_num = identity_parts[1] if len(identity_parts) > 1 else "01"
+                voice_name = identity_parts[0] if len(identity_parts) > 1 else parts
+
+                # Parse faction and language from voice_name
+                FACTION_MAP = {
+                    "Ger": "German", "Rus": "Russian",
+                    "Eng": "American", "Jap": "Japanese",
+                }
+                faction = "Unknown"
+                language = "Unknown"
+                for prefix, fac in FACTION_MAP.items():
+                    if voice_name.startswith(prefix):
+                        faction = fac
+                        language = voice_name[len(prefix):]
+                        if not language:
+                            language = "Native"
+                        break
+
+                # Group files by action
+                actions = {}
+                for fp in files:
+                    fname = Path(fp).stem
+                    # Strip intensity/variant suffix: _H_274, _L_280, _N_265, _NOR_1, etc
+                    action = re.sub(r"_[HLN]_\d+.*$", "", fname)
+                    action = re.sub(r"_(NOR|LOW|HER|SUP|OFF)_\d+.*$", "", fname, flags=re.I)
+                    action = re.sub(r"_\d+$", "", action)
+                    actions.setdefault(action, []).append(fp)
+
+                full_id = ("Tank_" + voice_id) if is_tank else voice_id
+                categories["voices"][full_id] = {
+                    "faction": faction,
+                    "language": language,
+                    "type": "tank" if is_tank else "infantry",
+                    "voice_num": voice_num,
+                    "actions": actions,
+                }
+
+            # Weapon folders: AUD_Firearms_* or AUD_RS_Firearms_*
+            elif "_Firearms_" in name or name.endswith("_Firearms") or "_Flamethrower_" in name or "_Melee_" in name:
+                # Extract weapon type and name
+                if "_Firearms_" in name:
+                    weapon_part = name.split("_Firearms_")[1] if "_Firearms_" in name else name
+                elif "_Flamethrower_" in name:
+                    weapon_part = "Flamethrower_" + name.split("_Flamethrower_")[1]
+                elif "_Melee_" in name:
+                    weapon_part = "Melee_" + name.split("_Melee_")[1]
+                else:
+                    weapon_part = name
+
+                # Parse type from prefix: Rifle_, SMG_, MG_, Pistol_, etc
+                wtype = "misc"
+                for t in ["Rifle", "SMG", "MG", "LMG", "HMG", "BAR", "Pistol",
+                          "AT", "Shotgun", "Tails", "Flamethrower", "Melee"]:
+                    if weapon_part.startswith(t):
+                        wtype = t
+                        break
+
+                categories["weapons"][weapon_part] = {
+                    "type": wtype,
+                    "clips": files,
+                }
+
+            # Vehicle folders
+            elif "_Vehicle_" in name:
+                categories["vehicles"][name] = {"clips": files}
+
+            # Explosions
+            elif "_EXP_" in name:
+                categories["explosions"][name] = {"clips": files}
+
+            # Environment/ambient
+            elif "_Environment" in name or "_ENV_" in name or "_EnvironmentSounds" in name:
+                categories["environment"][name] = {"clips": files}
+
+            # Character (footsteps, foley, bodyfall)
+            elif "_Character" in name or "_Weapon_Foley" in name:
+                categories["character"][name] = {"clips": files}
+
+            # Everything else
+            else:
+                categories["other"][name] = {"clips": files}
+
+        catalogue[game] = categories
+
+    return catalogue
+
+
+def load_ro2_catalogue():
+    if RO2_CATALOGUE_FILE.exists():
+        with open(RO2_CATALOGUE_FILE) as f:
+            return json.load(f)
+    catalogue = scan_ro2_catalogue()
+    if catalogue:
+        RO2_CATALOGUE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(RO2_CATALOGUE_FILE, "w") as f:
+            json.dump(catalogue, f, indent=2)
+    return catalogue
+
+
+def load_swaps():
+    if SWAPS_FILE.exists():
+        with open(SWAPS_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def save_swaps(swaps):
+    SWAPS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(SWAPS_FILE, "w") as f:
+        json.dump(swaps, f, indent=2)
+
+
+EXPORT_DIR = DATA_DIR / "export" / "BepInEx" / "plugins" / "ER2AudioMod"
+
+
+def export_mod():
+    """Export all swaps as a BepInEx mod package."""
+    import shutil
+
+    swaps = load_swaps()
+    if not swaps:
+        return {"ok": False, "error": "No swaps to export"}
+
+    data = load_mapping()
+    refs = build_refs(data)
+
+    # Clean and recreate export dir
+    export_root = DATA_DIR / "export"
+    if export_root.exists():
+        shutil.rmtree(export_root)
+
+    audio_dir = EXPORT_DIR / "audio"
+    audio_dir.mkdir(parents=True)
+
+    # Copy custom files and build manifest
+    manifest = {}
+    for original, custom_name in swaps.items():
+        custom_src = CUSTOM_DIR / custom_name
+        if not custom_src.exists():
+            continue
+
+        # Use original filename as the replacement name so the plugin
+        # can match by name. Keep the custom file's actual extension.
+        custom_ext = Path(custom_name).suffix
+        export_name = Path(original).stem + custom_ext
+        shutil.copy2(custom_src, audio_dir / export_name)
+
+        # Build manifest entry with full reference info
+        clip_refs = refs.get(original, [])
+        manifest[original] = {
+            "replacement": export_name,
+            "references": clip_refs,
+        }
+
+    # Write manifest
+    with open(EXPORT_DIR / "manifest.json", "w") as f:
+        json.dump(manifest, f, indent=2)
+
+    return {
+        "ok": True,
+        "path": str(EXPORT_DIR),
+        "swaps": len(manifest),
+        "files": len(list(audio_dir.iterdir())),
+    }
+
+
 # ---------------------------------------------------------------------------
 # HTTP Handler
 # ---------------------------------------------------------------------------
@@ -272,50 +564,114 @@ class Handler(BaseHTTPRequestHandler):
             self._send(PAGE_HTML, "text/html")
         elif path == "/api/mapping":
             self._send_json(load_mapping())
+        elif path == "/api/refs":
+            data = load_mapping()
+            self._send_json(build_refs(data))
+        elif path == "/api/swaps":
+            self._send_json(load_swaps())
+        elif path == "/api/audioinfo":
+            self._send_json(build_audio_info_cache())
+        elif path == "/api/ro2":
+            self._send_json(load_ro2_catalogue())
         elif path == "/api/rescan":
             data = scan_from_prefabs()
             save_mapping(data)
             self._send_json(data)
         elif path.startswith("/audio/"):
             self._serve_audio(unquote(path[7:]))
+        elif path.startswith("/ro2audio/"):
+            self._serve_ro2(unquote(path[10:]))
+        elif path.startswith("/custom/"):
+            self._serve_custom(unquote(path[8:]))
         else:
             self.send_error(404)
 
     def do_POST(self):
         path = unquote(self.path)
-        length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(self.rfile.read(length)) if length else {}
 
-        if path == "/api/move":
-            self._send_json(self._handle_move(body))
+        if path == "/api/swap":
+            self._handle_swap()
+        elif path == "/api/swap/revert":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            self._send_json(self._handle_revert(body))
+        elif path == "/api/export":
+            self._send_json(export_mod())
         else:
             self.send_error(404)
 
-    def _handle_move(self, body):
-        data = load_mapping()
-        voices = data["voices"]
-        fn = body.get("filename")
-        fe, fa = body.get("from_entity"), body.get("from_action")
-        te, ta = body.get("to_entity"), body.get("to_action")
+    def _handle_swap(self):
+        """Handle multipart file upload to swap a clip."""
+        content_type = self.headers.get("Content-Type", "")
+        if "multipart/form-data" not in content_type:
+            self.send_error(400, "Expected multipart/form-data")
+            return
 
-        if fe in voices and fa in voices[fe]:
-            clips = voices[fe][fa]
-            if fn in clips:
-                clips.remove(fn)
-            if not clips:
-                del voices[fe][fa]
-            if not voices[fe]:
-                del voices[fe]
+        # Parse boundary
+        boundary = content_type.split("boundary=")[-1].encode()
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length)
 
-        voices.setdefault(te, {}).setdefault(ta, []).append(fn)
-        save_mapping(data)
+        # Simple multipart parser
+        parts = body.split(b"--" + boundary)
+        original = None
+        file_data = None
+        file_ext = None
+
+        for part in parts:
+            if b"Content-Disposition" not in part:
+                continue
+            header, _, content = part.partition(b"\r\n\r\n")
+            content = content.rstrip(b"\r\n--")
+            header_str = header.decode("utf-8", errors="replace")
+
+            if 'name="original"' in header_str:
+                original = content.decode().strip()
+            elif 'name="file"' in header_str:
+                file_data = content
+                # Extract filename for extension
+                if "filename=" in header_str:
+                    fn = header_str.split('filename="')[1].split('"')[0]
+                    file_ext = Path(fn).suffix or ".wav"
+
+        if not original or not file_data:
+            self.send_error(400, "Missing original or file")
+            return
+
+        # Save custom file
+        CUSTOM_DIR.mkdir(parents=True, exist_ok=True)
+        # Use original filename stem + custom extension
+        custom_name = Path(original).stem + "_custom" + (file_ext or ".wav")
+        custom_path = CUSTOM_DIR / custom_name
+        with open(custom_path, "wb") as f:
+            f.write(file_data)
+
+        # Update swaps manifest
+        swaps = load_swaps()
+        swaps[original] = custom_name
+        save_swaps(swaps)
+
+        self._send_json({"ok": True, "original": original, "custom": custom_name})
+
+    def _handle_revert(self, body):
+        """Revert a swap back to original."""
+        original = body.get("original")
+        if not original:
+            return {"ok": False, "error": "Missing original"}
+
+        swaps = load_swaps()
+        custom_name = swaps.pop(original, None)
+        save_swaps(swaps)
+
+        # Delete custom file
+        if custom_name:
+            custom_path = CUSTOM_DIR / custom_name
+            if custom_path.exists():
+                custom_path.unlink()
+
         return {"ok": True}
 
-    def _serve_audio(self, filename):
-        filepath = AUDIO_DIR / filename
-        if not filepath.exists() or not filepath.is_file():
-            self.send_error(404)
-            return
+    def _serve_file(self, filepath):
         mime = mimetypes.guess_type(str(filepath))[0] or "application/octet-stream"
         self.send_response(200)
         self.send_header("Content-Type", mime)
@@ -324,6 +680,27 @@ class Handler(BaseHTTPRequestHandler):
         with open(filepath, "rb") as f:
             while chunk := f.read(65536):
                 self.wfile.write(chunk)
+
+    def _serve_audio(self, filename):
+        filepath = AUDIO_DIR / filename
+        if not filepath.exists() or not filepath.is_file():
+            self.send_error(404)
+            return
+        self._serve_file(filepath)
+
+    def _serve_ro2(self, filepath):
+        full = RO2_DIR / filepath
+        if not full.exists() or not full.is_file():
+            self.send_error(404)
+            return
+        self._serve_file(full)
+
+    def _serve_custom(self, filename):
+        filepath = CUSTOM_DIR / filename
+        if not filepath.exists() or not filepath.is_file():
+            self.send_error(404)
+            return
+        self._serve_file(filepath)
 
     def _send_json(self, data):
         self._send(json.dumps(data), "application/json")
@@ -402,6 +779,16 @@ PAGE_HTML = r"""<!DOCTYPE html>
   .clip .actions button { background: #0f3460; border: none; color: #e0e0e0;
                           padding: 4px 8px; border-radius: 3px; cursor: pointer; font-size: 11px; }
   .clip .actions button:hover { background: #e94560; }
+  .clip.swapped { border-color: #2ecc71; }
+  .clip.swapped .name { color: #2ecc71; }
+  .clip-info { font-size: 10px; color: #666; white-space: nowrap; }
+  .badge { background: #e94560; color: white; font-size: 9px; padding: 1px 5px;
+           border-radius: 8px; margin-left: 4px; vertical-align: middle; }
+  .badge.warn { background: #e67e22; }
+  .swap-info { font-size: 11px; color: #2ecc71; margin-left: 8px; }
+  .ref-list { font-size: 11px; color: #888; max-height: 200px; overflow-y: auto;
+              margin: 8px 0 16px; padding: 8px; background: #1a1a2e; border-radius: 4px; }
+  .ref-list div { padding: 2px 0; }
 
   .modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex;
               align-items: center; justify-content: center; z-index: 100; }
@@ -433,7 +820,8 @@ PAGE_HTML = r"""<!DOCTYPE html>
 
 <div id="main">
   <div id="toolbar">
-    <button class="secondary" onclick="rescan()">Rescan Files</button>
+    <button class="secondary" onclick="rescan()">Rescan</button>
+    <button onclick="exportMod()">Export Mod</button>
     <input type="text" id="clip-filter" placeholder="Filter by filename or action..."
            oninput="renderEntity(currentEntity)" style="background:#1a1a2e;border:1px solid #0f3460;
            color:#e0e0e0;padding:6px 10px;border-radius:4px;font-size:12px;width:260px;">
@@ -448,6 +836,9 @@ PAGE_HTML = r"""<!DOCTYPE html>
 
 <script>
 let data = null;
+let refs = {};
+let swaps = {};
+let audioInfo = {};
 let currentEntity = null;
 let currentAudio = null;
 let currentTab = 0;
@@ -506,10 +897,41 @@ function renderTabs() {
 }
 
 async function init() {
-  data = await (await fetch('/api/mapping')).json();
+  var results = await Promise.all([
+    fetch('/api/mapping').then(function(r) { return r.json(); }),
+    fetch('/api/refs').then(function(r) { return r.json(); }),
+    fetch('/api/swaps').then(function(r) { return r.json(); }),
+    fetch('/api/audioinfo').then(function(r) { return r.json(); }),
+  ]);
+  data = results[0]; refs = results[1]; swaps = results[2]; audioInfo = results[3];
   renderTabs();
   renderSidebar();
   updateStats();
+}
+
+async function reloadAll() {
+  var results = await Promise.all([
+    fetch('/api/mapping').then(function(r) { return r.json(); }),
+    fetch('/api/refs').then(function(r) { return r.json(); }),
+    fetch('/api/swaps').then(function(r) { return r.json(); }),
+  ]);
+  data = results[0]; refs = results[1]; swaps = results[2];
+  renderTabs();
+  renderSidebar();
+  updateStats();
+  if (currentEntity) renderEntity(currentEntity);
+}
+
+function fmtInfo(clip) {
+  var info = audioInfo[clip];
+  if (!info) return '';
+  var parts = [];
+  if (info.duration != null) parts.push(info.duration + 's');
+  if (info.sample_rate) parts.push((info.sample_rate / 1000) + 'kHz');
+  if (info.bit_depth) parts.push(info.bit_depth + 'bit');
+  if (info.channels) parts.push(info.channels === 1 ? 'mono' : 'stereo');
+  if (!parts.length) parts.push((info.size / 1024).toFixed(0) + 'KB');
+  return parts.join(' \u00b7 ');
 }
 
 function renderSidebar() {
@@ -580,13 +1002,35 @@ function renderEntity(entity) {
       var clip = clips[j];
       var ext = clip.split('.').pop().toLowerCase();
       var mime = ext === 'ogg' ? 'audio/ogg' : 'audio/wav';
-      html += '<div class="clip">' +
+      var refCount = (refs[clip] || []).length;
+      var isSwapped = !!swaps[clip];
+      var swapClass = isSwapped ? ' swapped' : '';
+      var customFile = swaps[clip] || '';
+
+      html += '<div class="clip' + swapClass + '">' +
         '<span class="name" title="' + esc(clip) + '">' + esc(clip) + '</span>' +
-        '<audio controls preload="none" onplay="playClip(this)">' +
-        '<source src="/audio/' + encodeURIComponent(clip) + '" type="' + mime + '">' +
-        '</audio>' +
-        '<div class="actions">' +
-        '<button onclick="moveClip(\'' + escAttr(entity) + '\',\'' + escAttr(action) + '\',\'' + escAttr(clip) + '\')">Move</button>' +
+        '<span class="clip-info">' + fmtInfo(clip) + '</span>';
+
+      if (refCount > 1) {
+        html += '<span class="badge warn" style="cursor:pointer" onclick="showRefs(\'' + escAttr(clip) + '\')">' + refCount + ' refs</span>';
+      }
+
+      if (isSwapped) {
+        html += '<span class="swap-info">swapped</span>' +
+          '<audio controls preload="none" onplay="playClip(this)">' +
+          '<source src="/custom/' + encodeURIComponent(customFile) + '" type="' + mime + '">' +
+          '</audio>';
+      } else {
+        html += '<audio controls preload="none" onplay="playClip(this)">' +
+          '<source src="/audio/' + encodeURIComponent(clip) + '" type="' + mime + '">' +
+          '</audio>';
+      }
+
+      html += '<div class="actions">';
+      if (isSwapped) {
+        html += '<button onclick="revertSwap(\'' + escAttr(clip) + '\')">Revert</button>';
+      }
+      html += '<button onclick="swapClip(\'' + escAttr(clip) + '\')">Swap</button>' +
         '</div></div>';
     }
     html += '</div></div>';
@@ -595,70 +1039,116 @@ function renderEntity(entity) {
   content.innerHTML = html;
 }
 
-function moveClip(fromEntity, fromAction, filename) {
-  var entities = Object.keys(data.voices).sort(entitySort);
-  var root = document.getElementById('modal-root');
-
-  root.innerHTML = '<div class="modal-bg" onclick="if(event.target===this)closeModal()">' +
-    '<div class="modal">' +
-    '<h3>Move Clip</h3>' +
-    '<p style="font-size:12px;color:#888;margin-bottom:16px;">' + esc(filename) + '</p>' +
-    '<label>Entity</label>' +
-    '<input id="mv-entity" list="mv-entity-list" value="' + esc(fromEntity) + '">' +
-    '<datalist id="mv-entity-list">' +
-    entities.map(function(e) { return '<option value="' + esc(e) + '">'; }).join('') +
-    '</datalist>' +
-    '<label>Action</label>' +
-    '<input id="mv-action" list="mv-action-list" value="' + esc(fromAction) + '">' +
-    '<datalist id="mv-action-list"></datalist>' +
-    '<div class="btn-row">' +
-    '<button class="btn-cancel" onclick="closeModal()">Cancel</button>' +
-    '<button class="btn-ok" onclick="doMove(\'' + escAttr(fromEntity) + '\',\'' + escAttr(fromAction) + '\',\'' + escAttr(filename) + '\')">Move</button>' +
-    '</div></div></div>';
-
-  var entInput = document.getElementById('mv-entity');
-  entInput.addEventListener('input', function() {
-    var ent = entInput.value;
-    var dl = document.getElementById('mv-action-list');
-    if (data.voices[ent]) {
-      dl.innerHTML = Object.keys(data.voices[ent]).sort()
-        .map(function(a) { return '<option value="' + esc(a) + '">'; }).join('');
-    }
-  });
-  entInput.dispatchEvent(new Event('input'));
-}
-
 function closeModal() {
   document.getElementById('modal-root').innerHTML = '';
 }
 
-async function doMove(fromEntity, fromAction, filename) {
-  var toEntity = document.getElementById('mv-entity').value.trim();
-  var toAction = document.getElementById('mv-action').value.trim();
-  if (!toEntity || !toAction) return;
+function showRefs(clip) {
+  var clipRefs = refs[clip] || [];
+  var root = document.getElementById('modal-root');
+  var html = '<div class="modal-bg" onclick="if(event.target===this)closeModal()">' +
+    '<div class="modal">' +
+    '<h3>References</h3>' +
+    '<p style="font-size:12px;color:#888;margin-bottom:12px;">' + esc(clip) + ' is used by ' + clipRefs.length + ' entities:</p>' +
+    '<div class="ref-list">';
+  for (var i = 0; i < clipRefs.length; i++) {
+    html += '<div>' + esc(clipRefs[i].entity) + ' <span style="color:#555">/</span> ' + esc(clipRefs[i].action) + '</div>';
+  }
+  html += '</div>' +
+    '<div class="btn-row"><button class="btn-ok" onclick="closeModal()">OK</button></div>' +
+    '</div></div>';
+  root.innerHTML = html;
+}
 
-  await fetch('/api/move', {
+function swapClip(original) {
+  var clipRefs = refs[original] || [];
+  var root = document.getElementById('modal-root');
+
+  var refHtml = '';
+  if (clipRefs.length > 1) {
+    refHtml = '<div style="margin-bottom:12px;"><span class="badge warn">' + clipRefs.length + ' references</span>' +
+      ' Swapping this file will affect:</div>' +
+      '<div class="ref-list">';
+    for (var i = 0; i < clipRefs.length; i++) {
+      refHtml += '<div>' + esc(clipRefs[i].entity) + ' / ' + esc(clipRefs[i].action) + '</div>';
+    }
+    refHtml += '</div>';
+  }
+
+  root.innerHTML = '<div class="modal-bg" onclick="if(event.target===this)closeModal()">' +
+    '<div class="modal">' +
+    '<h3>Swap Audio Clip</h3>' +
+    '<p style="font-size:12px;color:#888;margin-bottom:12px;">' + esc(original) + '</p>' +
+    refHtml +
+    '<label>Original</label>' +
+    '<audio controls preload="none" style="width:100%;height:32px;margin-bottom:12px;">' +
+    '<source src="/audio/' + encodeURIComponent(original) + '"></audio>' +
+    '<label>Replacement file (.wav / .ogg)</label>' +
+    '<input type="file" id="swap-file" accept=".wav,.ogg,.mp3" style="margin-bottom:12px;font-size:12px;">' +
+    '<div id="swap-preview"></div>' +
+    '<div class="btn-row">' +
+    '<button class="btn-cancel" onclick="closeModal()">Cancel</button>' +
+    '<button class="btn-ok" onclick="doSwap(\'' + escAttr(original) + '\')">Swap</button>' +
+    '</div></div></div>';
+
+  document.getElementById('swap-file').addEventListener('change', function(e) {
+    var file = e.target.files[0];
+    if (file) {
+      var url = URL.createObjectURL(file);
+      document.getElementById('swap-preview').innerHTML =
+        '<label>Preview</label><audio controls style="width:100%;height:32px;margin-bottom:12px;"><source src="' + url + '"></audio>';
+    }
+  });
+}
+
+async function doSwap(original) {
+  var fileInput = document.getElementById('swap-file');
+  if (!fileInput.files.length) return;
+
+  var formData = new FormData();
+  formData.append('original', original);
+  formData.append('file', fileInput.files[0]);
+
+  await fetch('/api/swap', { method: 'POST', body: formData });
+  closeModal();
+  await reloadAll();
+}
+
+async function revertSwap(original) {
+  await fetch('/api/swap/revert', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({
-      filename: filename,
-      from_entity: fromEntity,
-      from_action: fromAction,
-      to_entity: toEntity,
-      to_action: toAction
-    })
+    body: JSON.stringify({ original: original })
   });
+  await reloadAll();
+}
 
-  closeModal();
-  data = await (await fetch('/api/mapping')).json();
-  renderTabs();
-  renderSidebar();
-  updateStats();
-  if (currentEntity) renderEntity(currentEntity);
+async function exportMod() {
+  var res = await fetch('/api/export', { method: 'POST' });
+  var result = await res.json();
+  var root = document.getElementById('modal-root');
+  if (result.ok) {
+    root.innerHTML = '<div class="modal-bg" onclick="if(event.target===this)closeModal()">' +
+      '<div class="modal">' +
+      '<h3>Mod Exported</h3>' +
+      '<p style="margin-bottom:12px;">' + result.swaps + ' swaps exported, ' + result.files + ' audio files.</p>' +
+      '<p style="font-size:12px;color:#888;margin-bottom:16px;">Output: <code>' + esc(result.path) + '</code></p>' +
+      '<p style="font-size:12px;color:#888;margin-bottom:16px;">Copy the <code>BepInEx</code> folder into your Easy Red 2 install directory.</p>' +
+      '<div class="btn-row"><button class="btn-ok" onclick="closeModal()">OK</button></div>' +
+      '</div></div>';
+  } else {
+    root.innerHTML = '<div class="modal-bg" onclick="if(event.target===this)closeModal()">' +
+      '<div class="modal">' +
+      '<h3>Export Failed</h3>' +
+      '<p style="color:#e94560;">' + esc(result.error || 'Unknown error') + '</p>' +
+      '<div class="btn-row"><button class="btn-ok" onclick="closeModal()">OK</button></div>' +
+      '</div></div>';
+  }
 }
 
 async function rescan() {
   data = await (await fetch('/api/rescan')).json();
+  refs = await (await fetch('/api/refs')).json();
   renderTabs();
   renderSidebar();
   updateStats();
