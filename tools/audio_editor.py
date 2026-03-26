@@ -680,9 +680,11 @@ def _write_plugin_source(export_dir):
 using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using BepInEx;
 using BepInEx.Unity.IL2CPP;
 using HarmonyLib;
+using Il2CppInterop.Runtime;
 using UnityEngine;
 
 namespace ER2AudioMod
@@ -793,15 +795,74 @@ namespace ER2AudioMod
         }
     }
 
-    // Patch voice sounds
+    // Native IL2CPP array reader for VoiceManager
+    static class NativeVoiceReader
+    {
+        private static readonly Dictionary<string, int> _offsets = new();
+        private static IntPtr _vmClass = IntPtr.Zero;
+
+        static int GetOffset(string fieldName)
+        {
+            if (_offsets.TryGetValue(fieldName, out var cached))
+                return cached;
+
+            if (_vmClass == IntPtr.Zero)
+                _vmClass = Il2CppInterop.Runtime.Il2CppClassPointerStore<VoiceManager>.NativeClassPtr;
+
+            var field = IL2CPP.il2cpp_class_get_field_from_name(_vmClass, fieldName);
+            if (field == IntPtr.Zero)
+            {
+                _offsets[fieldName] = -1;
+                return -1;
+            }
+
+            var offset = (int)IL2CPP.il2cpp_field_get_offset(field);
+            _offsets[fieldName] = offset;
+            return offset;
+        }
+
+        public static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<AudioClip> ReadArray(VoiceManager instance, string fieldName)
+        {
+            var offset = GetOffset(fieldName);
+            if (offset < 0) return null;
+            var ptr = Marshal.ReadIntPtr(instance.Pointer + offset);
+            if (ptr == IntPtr.Zero) return null;
+            return new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<AudioClip>(ptr);
+        }
+    }
+
     [HarmonyPatch(typeof(VoiceManager), nameof(VoiceManager.GetVoice))]
     class Patch_GetVoice
     {
-        static bool Prefix(VoiceManager.VoiceClip clip, int index, ref AudioClip __result)
+        static HashSet<int> _logged = new();
+
+        static bool Prefix(VoiceManager __instance, VoiceManager.VoiceClip clip, int index, ref AudioClip __result)
         {
-            // TODO: Map VoiceClip enum to the clip arrays and check for replacements
-            // This requires runtime inspection of which clips are assigned to which arrays
-            return true; // run original for now
+            var replacements = AudioModPlugin.ReplacementClips;
+            if (replacements.Count == 0) return true;
+
+            var fieldName = clip.ToString();
+            var array = NativeVoiceReader.ReadArray(__instance, fieldName);
+            if (array == null || array.Length == 0) return true;
+
+            int i = (index >= 0 && index < array.Length)
+                ? index
+                : UnityEngine.Random.Range(0, array.Length);
+
+            var originalClip = array[i];
+            if (originalClip == null) return true;
+
+            if (replacements.TryGetValue(originalClip.name + ".wav", out var replacement))
+            {
+                __result = replacement;
+
+                if (_logged.Add(__instance.GetInstanceID() * 1000 + (int)clip))
+                    AudioModPlugin.Log.LogInfo($"[VOICE] Swapped {fieldName}[{i}]: {originalClip.name} -> {replacement.name}");
+
+                return false;
+            }
+
+            return true;
         }
     }
 }
