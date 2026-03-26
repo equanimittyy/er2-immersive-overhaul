@@ -1182,6 +1182,8 @@ PAGE_HTML = r"""<!DOCTYPE html>
   .entity-item:hover { background: #0f3460; }
   .entity-item.active { background: #e94560; color: white; }
   .entity-item .count { opacity: 0.5; font-size: 11px; }
+  .entity-item.edited { border-left: 3px solid #e94560; }
+  .entity-item.edited .count { color: #e94560; opacity: 1; }
 
   #main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
   #toolbar { padding: 12px 20px; background: #16213e; border-bottom: 1px solid #0f3460;
@@ -1548,6 +1550,19 @@ function fmtInfo(clip) {
   return parts.join(' \u00b7 ');
 }
 
+function entitySwapCount(entity) {
+  var actions = data.voices[entity];
+  if (!actions) return 0;
+  var n = 0;
+  for (var action in actions) {
+    var clips = actions[action];
+    for (var i = 0; i < clips.length; i++) {
+      if (swaps[clips[i]]) n++;
+    }
+  }
+  return n;
+}
+
 function renderSidebar() {
   var list = document.getElementById('entity-list');
   var filter = document.getElementById('entity-filter').value.toLowerCase();
@@ -1560,10 +1575,14 @@ function renderSidebar() {
   var html = '';
   for (var i = 0; i < filtered.length; i++) {
     var e = filtered[i];
-    var count = Object.values(data.voices[e]).reduce(function(s, c) { return s + c.length; }, 0);
-    var cls = e === currentEntity ? 'entity-item active' : 'entity-item';
+    var total = Object.values(data.voices[e]).reduce(function(s, c) { return s + c.length; }, 0);
+    var edited = entitySwapCount(e);
+    var cls = 'entity-item';
+    if (e === currentEntity) cls += ' active';
+    if (edited > 0) cls += ' edited';
+    var countLabel = edited > 0 ? edited + '/' + total : '' + total;
     html += '<div class="' + cls + '" onclick="selectEntity(\'' + escAttr(e) + '\')">' +
-      '<span>' + esc(e) + '</span><span class="count">' + count + '</span></div>';
+      '<span>' + esc(e) + '</span><span class="count">' + countLabel + '</span></div>';
   }
   list.innerHTML = html;
 }
