@@ -1,6 +1,9 @@
 # Extracted game assets (large binary files, not suitable for git)
 data/
 
+# Mod export output
+export/
+
 # Python
 .venv/
 __pycache__/

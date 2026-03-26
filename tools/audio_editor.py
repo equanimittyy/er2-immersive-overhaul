@@ -592,7 +592,7 @@ def delete_profile(name):
     return {"ok": True}
 
 
-EXPORT_DIR = DATA_DIR / "export" / "BepInEx" / "plugins" / "ER2AudioMod"
+EXPORT_DIR = Path(__file__).resolve().parent.parent / "export" / "ER2AudioMod"
 
 
 def export_mod():
@@ -1818,8 +1818,9 @@ async function exportMod() {
       '<h3>Mod Exported</h3>' +
       '<p style="margin-bottom:12px;">' + result.swaps + ' swaps exported, ' + result.files + ' audio files.</p>' +
       '<p style="font-size:12px;color:#888;margin-bottom:8px;">Output: <code>' + esc(result.path) + '</code></p>' +
-      '<p style="font-size:12px;color:#888;margin-bottom:8px;">1. Build the plugin: <code>cd src &amp;&amp; dotnet build -c Release</code></p>' +
-      '<p style="font-size:12px;color:#888;margin-bottom:16px;">2. Copy <code>ER2AudioMod.dll</code> + <code>manifest.json</code> + <code>audio/</code> into <code>BepInEx/plugins/ER2AudioMod/</code></p>' +
+      '<p style="font-size:12px;color:#888;margin-bottom:8px;">1. Build: <code>cd src &amp;&amp; dotnet build -c Release</code></p>' +
+      '<p style="font-size:12px;color:#888;margin-bottom:8px;">2. Copy the built <code>ER2AudioMod.dll</code> into the export folder alongside <code>manifest.json</code> + <code>audio/</code></p>' +
+      '<p style="font-size:12px;color:#888;margin-bottom:16px;">3. Copy the entire <code>ER2AudioMod/</code> folder into your game\'s <code>BepInEx/plugins/</code></p>' +
       '<div class="btn-row"><button class="btn-ok" onclick="closeModal()">OK</button></div>' +
       '</div></div>';
   } else {

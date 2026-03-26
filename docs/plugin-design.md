@@ -92,21 +92,19 @@ The audio editor's **Export Mod** generates plugin source code in `src/`. To com
 
 - [.NET 6.0 SDK](https://dotnet.microsoft.com/download/dotnet/6.0) or later
 - BepInEx 6 Bleeding Edge installed in your ER2 game folder
-- Cpp2IL dummy DLLs generated (see [Tools & Decompilation](tools-and-decompilation.md))
+- Game launched at least once with BepInEx (generates `BepInEx/interop/` DLLs)
 
 ### Steps
 
-1. Run **Export Mod** in the audio editor — this creates `data/export/BepInEx/plugins/ER2AudioMod/`
-2. Open a terminal in the `src/` subfolder of the export
-3. Update the `<HintPath>` entries in `ER2AudioMod.csproj` to point to your local paths:
-   - `BepInEx.Core.dll`, `BepInEx.Unity.IL2CPP.dll`, `0Harmony.dll` — from `BepInEx/core/`
-   - `UnityEngine.dll` — from `Easy Red 2_Data/Managed/`
-   - `Assembly-CSharp.dll` — from your Cpp2IL `interop/` output
-4. Build:
+1. Set your ER2 install path in the audio editor (**Settings** button) — this is used to generate correct DLL references in the `.csproj`
+2. Run **Export Mod** — creates `export/ER2AudioMod/` with source, manifest, and audio
+3. Build:
    ```
+   cd export/ER2AudioMod/src
    dotnet build -c Release
    ```
-5. Copy the output `ER2AudioMod.dll` into `BepInEx/plugins/ER2AudioMod/` alongside `manifest.json` and `audio/`
+4. Copy the built `ER2AudioMod.dll` into the export folder alongside `manifest.json` and `audio/`
+5. Copy `ER2AudioMod/` into your game's `BepInEx/plugins/`
 6. Launch the game
 
 ### Verifying
