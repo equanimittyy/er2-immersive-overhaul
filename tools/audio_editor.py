@@ -1,313 +1,255 @@
 #!/usr/bin/env python3
 """ER2 Audio Editor — maps and manages audio clip assignments.
 
-Zero-dependency version using Python stdlib. If Flask is available,
-run with: flask --app audio_editor run -p 8420
-Otherwise just: python3 audio_editor.py
+Uses Unity prefab data (from AssetRipper) to build authoritative
+voice clip mappings. No regex guessing.
 """
 
 import json
 import mimetypes
+import os
 import re
-from functools import partial
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import unquote
 
-AUDIO_DIR = Path(__file__).resolve().parent.parent / "data" / "Assets" / "AudioClip"
-MAPPING_FILE = Path(__file__).resolve().parent.parent / "data" / "audio_mapping.json"
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+AUDIO_DIR = DATA_DIR / "AudioClip"
+VOICES_DIR = DATA_DIR / "voices"
+WEAPONS_DIR = DATA_DIR / "weapons"
+VEHICLES_DIR = DATA_DIR / "vehicles"
+MAPPING_FILE = DATA_DIR / "audio_mapping.json"
 PORT = 8420
 
+# GenericGun audio fields
+WEAPON_AUDIO_FIELDS = {
+    "fireSound", "fireSound_start", "fireSound_loop", "fireSound_tail",
+    "fireSound_distance", "fireSound_distance_loop", "fireSound_distance_tail",
+    "reload_sound_full", "reload_sound_half",
+    "chamber_sound", "chamber_sound_open", "chamber_sound_close",
+    "chamber_sound_open_noAmmo", "chamber_sound_close_noAmmo",
+    "boltaction_sound", "pingSound", "fps_change_barrell_sound", "sound",
+}
+
+# Vehicle audio fields
+VEHICLE_AUDIO_FIELDS = WEAPON_AUDIO_FIELDS | {
+    "engine_start", "engine_move", "engine_stop",
+    "crashSound", "turnSoundLoop_outside",
+}
+
 # ---------------------------------------------------------------------------
-# Filename Parsing
+# Prefab-based mapping builder
 # ---------------------------------------------------------------------------
 
-OLD_STYLE_NATIONS = {
-    "ger": "German",
-    "usa": "American",
-    "rus": "Russian",
-    "ita": "Italian",
-    "fr": "French",
-    "jap": "Japanese",
-    "eng": "English",
-}
-
-NEW_STYLE_NATIONS = {
-    "AUS": "Australian",
-    "CN": "Chinese",
-    "POL": "Polish",
-    "IND": "Indian",
-    "GB": "British",
-    "JP": "Japanese",
-    "CH": "CH",
-}
-
-MID_STYLE_NATIONS = {
-    "Eng": "English Tank",
-    "sgoti": "SGOTI",
-}
-
-RE_OLD = re.compile(
-    r"^(?P<nation>" + "|".join(OLD_STYLE_NATIONS) + r")"
-    r"(?P<voice>\d+)_(?P<action>.+?)(?P<variant>\d+)?\.\w+$",
-    re.IGNORECASE,
-)
-
-# New-style: AUS_2_ActionName001.wav, CH_4_coveringfire1.wav, JP_4_Follow_Me_2A.wav
-# Also handles CH4_Action_001.wav (no underscore between nation and voice number)
-RE_NEW = re.compile(
-    r"^(?P<nation>" + "|".join(NEW_STYLE_NATIONS) + r")"
-    r"[_]?(?P<voice>\d+)_(?P<action>[A-Za-z0-9][A-Za-z_ ]*?)_?(?P<variant>\d+[A-Za-z]?(?:-\d+)?)?\.\w+$",
-)
-
-RE_MID = re.compile(
-    r"^(?P<nation>" + "|".join(MID_STYLE_NATIONS) + r")"
-    r"_(?P<action>[A-Za-z0-9_ ]+?)(?P<variant>\d+)?\.\w+$",
-    re.IGNORECASE,
-)
-
-
-# Suffix-based categories for generic files
-SUFFIX_CATEGORIES = {
-    "_tank": "Tank Crew (Generic)",
-    "_com": "Commander",
-    "_radio": "Radio",
-    "_radioNPC": "Radio",
-}
-
-# French-language voice lines — map French text to action names
-FRENCH_ACTION_MAP = {
-    "aaaah": "scream",
-    "allez": "charge",
-    "argh": "scream",
-    "artillerie ennemi": "artilleryIncoming",
-    "artillerie ennemie": "artilleryIncoming",
-    "attaquez ce véhicule": "attackVehicle",
-    "attaquez cette position": "attackPosition",
-    "avec moi": "followMe",
-    "bien reçu": "radioConfirm",
-    "canon prêt": "cannonReady",
-    "canon rechargé": "gunReloaded",
-    "chaaarg": "charge",
-    "char ennemie": "enemyTankSpotted",
-    "chargez": "charge",
-    "cible détruite": "targetDestroyed",
-    "cible intacte": "targetIntact",
-    "cible manquée": "targetMissed",
-    "commandant tué": "commanderDead",
-    "conducteur tué": "driverDead",
-    "contact": "enemySpotted",
-    "d'accord": "yes",
-    "détruisez ce char": "attackTank",
-    "défendez": "holdPosition",
-    "déplacement": "imMoving",
-    "déplacez": "moveThere",
-    "désolé monsieur": "radioRequestDenied",
-    "en avant": "charge",
-    "en colonne": "columnFormation",
-    "en ligne": "lineFormation",
-    "enemirepérés": "enemySpotted",
-    "ennemi détruit": "enemyDestroyed",
-    "ennemi juste là": "enemySpotted",
-    "ennemi neutralisé": "enemyDown",
-    "ennemi repéré": "enemySpotted",
-    "ennemi touché": "enemyHit",
-    "ennemie détruit": "enemyDestroyed",
-    "ennemie juste là": "enemySpotted",
-    "ennemie neutralisé": "enemyDown",
-    "ennemie touché": "enemyHit",
-    "entrez": "getIn",
-    "feu": "fire",
-    "formez une colonne": "columnFormation",
-    "formez une ligne": "lineFormation",
-    "formation": "formation",
-    "grenade": "grenade",
-    "grenaaad": "grenade",
-    "il est mort": "enemyDown",
-    "il est à terre": "enemyDown",
-    "il faut sortir": "getOut",
-    "infanterie ennemi": "enemyInfantrySpotted",
-    "infanterieennemie": "enemyInfantrySpotted",
-    "j'abandonne": "surrender",
-    "j'ai besoin d'un médecin": "medic",
-    "j'ai mal": "gotHit",
-    "j'aibesoind'unmédecin": "medic",
-    "j'aimal": "gotHit",
-    "j'y vais": "imMoving",
-    "je bouge": "imMoving",
-    "je me rend": "surrender",
-    "je prend le commandement": "takingCommand",
-    "je prend sa place": "replaceSeat",
-    "je prends le commandement": "takingCommand",
-    "je prends sa place": "replaceSeat",
-    "je recharge": "reloading",
-    "je suis sous le feu": "underFire",
-    "je suis touché": "gotHit",
-    "jechargeunmunition": "reloading",
-    "jerecharge": "reloading",
-    "jesuissouslefeu": "underFire",
-    "jesuistouché": "gotHit",
-    "jolie tir": "niceShot",
-    "là-bas": "moveThere",
-    "maintenant": "fire",
-    "merci": "thanks",
-    "mitrailleur tué": "gunnerDead",
-    "médecin": "medic",
-    "ne tirez": "friendlyFire",
-    "notre conducteur est mort": "driverDead",
-    "notre radio est hs": "radiomanDead",
-    "notre tank est en feu": "tankOnFire",
-    "notre tank est hors": "tankDestroyed",
-    "notre tireur est mort": "gunnerDead",
-    "notre véhicule est hs": "vehicleDestroyed",
-    "ok": "yes",
-    "on bouge": "imMoving",
-    "on doit revenir": "retreat",
-    "on essuie des tirs": "underFire",
-    "on est touché": "gotHit",
-    "on n'a pas": "armorNotPenetrated",
-    "on se disperse": "spreadOut",
-    "opérateur radio tué": "radiomanDead",
-    "oui monsieur": "yesSir",
-    "oui": "yes",
-    "ouimonsieur": "yesSir",
-    "pilote tué": "driverDead",
-    "qg": "radioRequest",
-    "raté": "targetMissed",
-    "reçu": "radioConfirm",
-    "regardez où vous tirez": "friendlyFire",
-    "regardezouvoustirez": "friendlyFire",
-    "regroupement": "regroup",
-    "repli": "retreat",
-    "reddition": "surrender",
-    "sortez": "getOut",
-    "suivez-moi": "followMe",
-    "tenez cette position": "holdPosition",
-    "tirez": "fire",
-    "tirs de suppression": "coveringFire",
-    "touché": "enemyHit",
-    "tous en ligne": "lineFormation",
-    "un char ennemi": "enemyTankSpotted",
-    "woooah": "scream",
-    "à couvert": "takeCover",
-}
-
-# Generic English voice lines — map to action names
-GENERIC_VOICE_MAP = {
-    "checkYourFire": "friendlyFire",
-    "enemyDown": "enemyDown",
-    "enemyInfantry": "enemyInfantrySpotted",
-    "enemySpotted": "enemySpotted",
-    "enemyTank": "enemyTankSpotted",
-    "grenade": "grenade",
-    "hit": "gotHit",
-    "imgoing": "imMoving",
-    "incomingEnemyArtillery": "artilleryIncoming",
-    "longScream": "scream",
-    "medicine": "medic",
-    "reload": "reloading",
-    "scream": "scream",
-    "suppressing": "coveringFire",
-    "surrender": "surrender",
-    "underfire": "underFire",
-    "yes": "yes",
-    "enemydown": "enemyDown",
-    "medic": "medic",
-    "regroup": "regroup",
-    "werehit": "gotHit",
-    "screams": "scream",
-    "infantryspotted": "enemyInfantrySpotted",
-    "onfire": "onFire",
-    "miss": "targetMissed",
-    "enemyhit": "enemyHit",
-    "attack": "attack",
-    "thanks": "thanks",
-    "fire": "fire",
-    "targetdestroyed": "targetDestroyed",
-    "targetintact": "targetIntact",
-    "retreat": "retreat",
-    "num": "number",
-}
-
-
-def parse_voice_file(filename):
-    """Try to parse a voice file. Returns (entity, action, filename) or None."""
-    # New style first (more specific)
-    m = RE_NEW.match(filename)
-    if m:
-        nation = NEW_STYLE_NATIONS.get(m.group("nation"), m.group("nation"))
-        return f"{nation} Voice {m.group('voice')}", m.group("action"), filename
-
-    # Old style
-    m = RE_OLD.match(filename)
-    if m:
-        nation = OLD_STYLE_NATIONS.get(m.group("nation").lower(), m.group("nation"))
-        return f"{nation} Voice {m.group('voice')}", m.group("action"), filename
-
-    # Mid style (no voice number)
-    m = RE_MID.match(filename)
-    if m:
-        key = m.group("nation")
-        nation = next((v for k, v in MID_STYLE_NATIONS.items()
-                       if k.lower() == key.lower()), key)
-        return nation, m.group("action"), filename
-
-    stem = Path(filename).stem
-
-    # Bare numbers: 0.ogg, 0_0.ogg, 0_radio.ogg etc
-    if re.match(r"^\d+(_\d+)?$", stem) or re.match(r"^\d+_radio$", stem):
-        return "Numbers (Generic)", "number", filename
-
-    # Suffix-based: _tank.ogg, _com.ogg, _radio.ogg, _radioNPC.ogg
-    for suffix, entity in SUFFIX_CATEGORIES.items():
-        if stem.endswith(suffix) or stem.endswith(suffix.replace("_", "")):
-            action = stem[:stem.rfind(suffix.replace("_", "")) if "_" not in stem[:stem.rfind(".")] else stem.rfind(suffix)]
-            # Clean action: remove trailing digits
-            action = re.sub(r"\d+$", "", stem.rsplit(suffix.lstrip("_"))[0].rstrip("_"))
-            if not action:
-                action = "misc"
-            return entity, action, filename
-
-    # French-language voice lines
-    lower_stem = stem.lower()
-    for french_key, action in FRENCH_ACTION_MAP.items():
-        if lower_stem.startswith(french_key.lower()):
-            return "French (Legacy)", action, filename
-
-    # Generic English voice lines (no nation prefix)
-    for pattern, action in GENERIC_VOICE_MAP.items():
-        if lower_stem.startswith(pattern.lower()):
-            return "Generic Voice", action, filename
-
-    return None
-
-
-def scan_audio_files():
-    """Scan audio directory and build entity -> action -> [files] mapping."""
-    mapping = {}
-
-    if not AUDIO_DIR.exists():
-        return mapping
-
-    for f in sorted(AUDIO_DIR.iterdir()):
-        if not f.is_file():
+def build_guid_map():
+    """Build guid -> filename map from .meta files alongside audio clips."""
+    guid_map = {}
+    for f in AUDIO_DIR.iterdir():
+        if f.suffix != ".meta":
             continue
-        result = parse_voice_file(f.name)
-        if result:
-            entity, action, fname = result
-            mapping.setdefault(entity, {}).setdefault(action, []).append(fname)
-        else:
-            mapping.setdefault("Uncategorised", {}).setdefault("misc", []).append(f.name)
+        with open(f) as fh:
+            for line in fh:
+                m = re.match(r"^guid:\s+(\w+)", line)
+                if m:
+                    guid_map[m.group(1)] = f.stem  # removes .meta, keeps .wav/.ogg
+                    break
+    return guid_map
 
-    return mapping
+
+def parse_prefab(path, guid_map):
+    """Parse a voice prefab YAML and return {field: [filenames]}."""
+    with open(path) as f:
+        content = f.read()
+
+    actions = {}
+    current_field = None
+    in_mono = False
+
+    for line in content.split("\n"):
+        if line.startswith("MonoBehaviour:"):
+            in_mono = True
+            continue
+        if not in_mono:
+            continue
+        if line.startswith("---"):
+            break
+
+        # Array header: "  fieldName:"
+        field_match = re.match(r"^  (\w+):\s*$", line)
+        if field_match:
+            current_field = field_match.group(1)
+            continue
+
+        # Inline value — not an array
+        if re.match(r"^  \w+:\s+\S", line):
+            current_field = None
+            continue
+
+        # Array item with guid
+        guid_match = re.match(r"^\s+-\s+\{.*guid:\s+(\w+)", line)
+        if guid_match and current_field:
+            guid = guid_match.group(1)
+            filename = guid_map.get(guid, f"UNKNOWN_{guid}")
+            actions.setdefault(current_field, []).append(filename)
+
+    # Filter out Unity internal fields
+    return {k: v for k, v in actions.items() if not k.startswith("m_")}
+
+
+def parse_equipment_prefab(path, guid_map, audio_fields):
+    """Parse a weapon/vehicle prefab and return {field: [filenames]} for audio fields."""
+    with open(path) as f:
+        content = f.read()
+
+    actions = {}
+    for line in content.split("\n"):
+        m = re.match(r"^\s+(\w+):\s+\{.*guid:\s+(\w+)", line)
+        if m:
+            field, guid = m.group(1), m.group(2)
+            if field in audio_fields:
+                filename = guid_map.get(guid, f"UNKNOWN_{guid}")
+                actions.setdefault(field, []).append(filename)
+
+    return actions
+
+
+def scan_from_prefabs():
+    """Build the full mapping from voice + weapon prefabs + audio meta files."""
+    guid_map = build_guid_map()
+
+    # Collect all audio filenames (excluding .meta)
+    all_audio = set()
+    for f in AUDIO_DIR.iterdir():
+        if f.is_file() and f.suffix != ".meta":
+            all_audio.add(f.name)
+
+    mapping = {}
+    assigned_files = set()
+
+    # Parse voice prefabs
+    for prefab_file in sorted(VOICES_DIR.iterdir()):
+        if prefab_file.suffix != ".prefab":
+            continue
+        entity_name = prefab_file.stem
+        actions = parse_prefab(prefab_file, guid_map)
+        if actions:
+            mapping[entity_name] = actions
+            for clips in actions.values():
+                assigned_files.update(clips)
+
+    # Parse weapon prefabs
+    for prefab_file in sorted(WEAPONS_DIR.iterdir()):
+        if prefab_file.suffix != ".prefab":
+            continue
+        actions = parse_equipment_prefab(prefab_file, guid_map, WEAPON_AUDIO_FIELDS)
+        if actions:
+            mapping[prefab_file.stem] = actions
+            for clips in actions.values():
+                assigned_files.update(clips)
+
+    # Parse vehicle prefabs (recursive — subdirs like tanks/, artillery/, etc.)
+    for prefab_file in sorted(VEHICLES_DIR.rglob("*.prefab")):
+        actions = parse_equipment_prefab(prefab_file, guid_map, VEHICLE_AUDIO_FIELDS)
+        if actions:
+            # Prefix with subfolder for clarity: "tanks/Sherman M4A1"
+            rel = prefab_file.relative_to(VEHICLES_DIR)
+            entity_name = str(rel.with_suffix(""))
+            mapping[entity_name] = actions
+            for clips in actions.values():
+                assigned_files.update(clips)
+
+    # Categorise unassigned files into relevant tabs
+    unassigned = sorted(all_audio - assigned_files)
+
+    # Weapon-related unassigned
+    weapon_uncat = {}
+    # Vehicle-related unassigned
+    vehicle_uncat = {}
+    # Truly misc
+    other_uncat = []
+
+    for f in unassigned:
+        fl = f.lower()
+
+        # Weapon-related: fire sounds, reload, bolt action, eject, distant MG/SMG
+        if any(kw in fl for kw in [
+            "_fire", "_reload", "_eject", "boltaction", "pingsound",
+            "dist_mg", "dist_smg", "dist_bofors", "dist_flak",
+            "m1919 browning", "m2browning", "mg42_", "type99_", "type11_",
+            "30mm_fire", "70mm_fire", "ppsh41_", "thompson_eng_drum",
+            "cannon_fire", "distant_mg",
+        ]):
+            # Try to extract weapon name
+            stem = Path(f).stem
+            if "Dist_" in f:
+                cat = "distant_fire"
+            elif "_reload" in fl or "_eject" in fl:
+                cat = "reload_misc"
+            else:
+                cat = "fire_misc"
+            weapon_uncat.setdefault(cat, []).append(f)
+
+        # Vehicle-related: tank, jeep, vehicle, turret, aircraft, engine
+        elif any(kw in fl for kw in [
+            "tank", "jeep", "vehicle", "turret", "aircraft",
+            "engine", "stuka", "whistle_lcvp", "tanks_threads",
+        ]):
+            if "tank" in fl or "turret" in fl or "tanks_threads" in fl:
+                cat = "tank_misc"
+            elif "jeep" in fl or "vehicle" in fl:
+                cat = "wheeled_misc"
+            elif "aircraft" in fl or "stuka" in fl:
+                cat = "aircraft_misc"
+            else:
+                cat = "vehicle_misc"
+            vehicle_uncat.setdefault(cat, []).append(f)
+
+        else:
+            other_uncat.append(f)
+
+    if weapon_uncat:
+        mapping["_Unassigned Weapons"] = weapon_uncat
+    if vehicle_uncat:
+        mapping["_Unassigned Vehicles"] = vehicle_uncat
+
+    # Sub-categorise the remaining "other" files by prefix
+    OTHER_GROUPS = [
+        ("footsteps",    ["fs_", "step_"]),
+        ("explosions",   ["explosion_", "artillerysmoke_", "smokegrenade_", "smokeartillery_"]),
+        ("grenades",     ["grenade_throw", "grenade_impact", "grenade_explosion",
+                          "molotov_", "explsv_"]),
+        ("flamethrower", ["flamer_"]),
+        ("ui_music",     ["intro_loading", "lorenzo", "objective_updated", "page_turn"]),
+        ("radio",        ["radio_noise"]),
+        ("ambient",      ["air_raid", "crow", "dog_tags"]),
+    ]
+
+    other_categorised = {}
+    truly_misc = []
+    for f in other_uncat:
+        fl = f.lower()
+        matched = False
+        for cat, prefixes in OTHER_GROUPS:
+            if any(fl.startswith(p) for p in prefixes):
+                other_categorised.setdefault(cat, []).append(f)
+                matched = True
+                break
+        if not matched:
+            truly_misc.append(f)
+
+    if truly_misc:
+        other_categorised["misc"] = truly_misc
+    if other_categorised:
+        mapping["Uncategorised"] = other_categorised
+
+    return {"voices": mapping}
 
 
 def load_mapping():
     if MAPPING_FILE.exists():
         with open(MAPPING_FILE) as f:
             return json.load(f)
-    mapping = scan_audio_files()
-    data = {"voices": mapping}
+    data = scan_from_prefabs()
     save_mapping(data)
     return data
 
@@ -331,12 +273,11 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/mapping":
             self._send_json(load_mapping())
         elif path == "/api/rescan":
-            mapping = scan_audio_files()
-            data = {"voices": mapping}
+            data = scan_from_prefabs()
             save_mapping(data)
             self._send_json(data)
         elif path.startswith("/audio/"):
-            self._serve_audio(path[7:])
+            self._serve_audio(unquote(path[7:]))
         else:
             self.send_error(404)
 
@@ -396,11 +337,11 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, fmt, *args):
-        pass  # quiet
+        pass
 
 
 # ---------------------------------------------------------------------------
-# HTML / JS — single page app
+# HTML / JS
 # ---------------------------------------------------------------------------
 
 PAGE_HTML = r"""<!DOCTYPE html>
@@ -415,9 +356,16 @@ PAGE_HTML = r"""<!DOCTYPE html>
 
   #sidebar { width: 280px; background: #16213e; border-right: 1px solid #0f3460;
              overflow-y: auto; flex-shrink: 0; display: flex; flex-direction: column; }
-  #sidebar h2 { padding: 16px; font-size: 14px; color: #e94560;
+  #sidebar h2 { padding: 12px 16px 8px; font-size: 14px; color: #e94560;
                  text-transform: uppercase; letter-spacing: 1px; flex-shrink: 0; }
-  .filter-bar { padding: 0 12px 8px; flex-shrink: 0; }
+  .tabs { display: flex; flex-shrink: 0; border-bottom: 2px solid #0f3460; }
+  .tab { flex: 1; padding: 8px 4px; text-align: center; font-size: 11px; cursor: pointer;
+         color: #888; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 2px solid transparent;
+         margin-bottom: -2px; }
+  .tab:hover { color: #e0e0e0; }
+  .tab.active { color: #e94560; border-bottom-color: #e94560; }
+  .tab .tab-count { font-size: 10px; opacity: 0.5; display: block; }
+  .filter-bar { padding: 8px 12px; flex-shrink: 0; }
   .filter-bar input { width: 100%; background: #1a1a2e; border: 1px solid #0f3460;
                       color: #e0e0e0; padding: 6px 10px; border-radius: 4px; font-size: 12px; }
   #entity-list { overflow-y: auto; flex: 1; }
@@ -475,9 +423,10 @@ PAGE_HTML = r"""<!DOCTYPE html>
 
 <div id="sidebar">
   <h2>ER2 Audio Editor</h2>
+  <div class="tabs" id="tabs"></div>
   <div class="filter-bar">
     <input type="text" id="entity-filter" placeholder="Filter entities..."
-           oninput="filterEntities()">
+           oninput="renderSidebar()">
   </div>
   <div id="entity-list"></div>
 </div>
@@ -485,6 +434,9 @@ PAGE_HTML = r"""<!DOCTYPE html>
 <div id="main">
   <div id="toolbar">
     <button class="secondary" onclick="rescan()">Rescan Files</button>
+    <input type="text" id="clip-filter" placeholder="Filter by filename or action..."
+           oninput="renderEntity(currentEntity)" style="background:#1a1a2e;border:1px solid #0f3460;
+           color:#e0e0e0;padding:6px 10px;border-radius:4px;font-size:12px;width:260px;">
     <span id="stats"></span>
   </div>
   <div id="content">
@@ -498,51 +450,94 @@ PAGE_HTML = r"""<!DOCTYPE html>
 let data = null;
 let currentEntity = null;
 let currentAudio = null;
+let currentTab = 0;
+
+var TAB_LABELS = ['Voices', 'Weapons', 'Vehicles', 'Other'];
 
 function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 function escAttr(s) { return s.replace(/\\/g,'\\\\').replace(/'/g,"\\'"); }
 
+function entityCategory(name) {
+  if (name === 'Uncategorised') return 3;
+  if (/^(Voice-|voice-|French Army)/i.test(name)) return 0;
+  if (/\//.test(name) || name === '_Unassigned Vehicles') return 2;
+  if (name === '_Unassigned Weapons') return 1;
+  return 1;
+}
+
 function entitySort(a, b) {
-  // Parse "Faction Voice N" or standalone names
-  var ma = a.match(/^(.+?)(?:\s+Voice\s+(\d+))?$/);
-  var mb = b.match(/^(.+?)(?:\s+Voice\s+(\d+))?$/);
-  var factionA = ma ? ma[1] : a;
-  var factionB = mb ? mb[1] : b;
-  if (factionA !== factionB) return factionA.localeCompare(factionB);
-  var numA = ma && ma[2] ? parseInt(ma[2]) : 0;
-  var numB = mb && mb[2] ? parseInt(mb[2]) : 0;
-  return numA - numB;
+  var pa = a.match(/^(?:Voice-|voice-)?([a-z]+)-?(\d+)$/i) || a.match(/^(.+?)\s*\(?(?:Voice\s*set\s*)?(\d+)\)?$/i);
+  var pb = b.match(/^(?:Voice-|voice-)?([a-z]+)-?(\d+)$/i) || b.match(/^(.+?)\s*\(?(?:Voice\s*set\s*)?(\d+)\)?$/i);
+  var na = pa ? pa[1].toLowerCase() : a.toLowerCase();
+  var nb = pb ? pb[1].toLowerCase() : b.toLowerCase();
+  if (na !== nb) return na.localeCompare(nb);
+  var da = pa && pa[2] ? parseInt(pa[2]) : 0;
+  var db = pb && pb[2] ? parseInt(pb[2]) : 0;
+  return da - db;
+}
+
+function getTabCounts() {
+  var counts = [0, 0, 0, 0];
+  Object.keys(data.voices).forEach(function(e) {
+    counts[entityCategory(e)]++;
+  });
+  return counts;
+}
+
+function switchTab(tab) {
+  currentTab = tab;
+  currentEntity = null;
+  document.getElementById('entity-filter').value = '';
+  renderTabs();
+  renderSidebar();
+  document.getElementById('content').innerHTML = '<p style="padding:40px;color:#888;">Select an entity from the sidebar.</p>';
+}
+
+function renderTabs() {
+  var counts = getTabCounts();
+  var html = '';
+  for (var i = 0; i < TAB_LABELS.length; i++) {
+    if (counts[i] === 0) continue;
+    var cls = i === currentTab ? 'tab active' : 'tab';
+    html += '<div class="' + cls + '" onclick="switchTab(' + i + ')">' +
+      TAB_LABELS[i] + '<span class="tab-count">' + counts[i] + '</span></div>';
+  }
+  document.getElementById('tabs').innerHTML = html;
 }
 
 async function init() {
   data = await (await fetch('/api/mapping')).json();
+  renderTabs();
   renderSidebar();
   updateStats();
 }
 
 function renderSidebar() {
-  const list = document.getElementById('entity-list');
-  const filter = document.getElementById('entity-filter').value.toLowerCase();
-  const entities = Object.keys(data.voices).sort(entitySort);
+  var list = document.getElementById('entity-list');
+  var filter = document.getElementById('entity-filter').value.toLowerCase();
+  var entities = Object.keys(data.voices).sort(entitySort);
 
-  list.innerHTML = entities
-    .filter(e => e.toLowerCase().includes(filter))
-    .map(e => {
-      const count = Object.values(data.voices[e]).reduce((s, c) => s + c.length, 0);
-      const cls = e === currentEntity ? 'entity-item active' : 'entity-item';
-      return `<div class="${cls}" onclick="selectEntity('${escAttr(e)}')" data-entity="${esc(e)}">
-        <span>${esc(e)}</span><span class="count">${count}</span></div>`;
-    }).join('');
+  var filtered = entities.filter(function(e) {
+    return entityCategory(e) === currentTab && e.toLowerCase().indexOf(filter) !== -1;
+  });
 
+  var html = '';
+  for (var i = 0; i < filtered.length; i++) {
+    var e = filtered[i];
+    var count = Object.values(data.voices[e]).reduce(function(s, c) { return s + c.length; }, 0);
+    var cls = e === currentEntity ? 'entity-item active' : 'entity-item';
+    html += '<div class="' + cls + '" onclick="selectEntity(\'' + escAttr(e) + '\')">' +
+      '<span>' + esc(e) + '</span><span class="count">' + count + '</span></div>';
+  }
+  list.innerHTML = html;
 }
 
-function filterEntities() { renderSidebar(); }
-
 function updateStats() {
-  const v = data.voices;
-  const ents = Object.keys(v).length;
-  const clips = Object.values(v).reduce((a, ent) =>
-    a + Object.values(ent).reduce((b, c) => b + c.length, 0), 0);
+  var v = data.voices;
+  var ents = Object.keys(v).length;
+  var clips = Object.values(v).reduce(function(a, ent) {
+    return a + Object.values(ent).reduce(function(b, c) { return b + c.length; }, 0);
+  }, 0);
   document.getElementById('stats').textContent =
     ents + ' entities \u2022 ' + clips + ' clips';
 }
@@ -562,21 +557,29 @@ function playClip(el) {
 }
 
 function renderEntity(entity) {
-  const content = document.getElementById('content');
-  const actions = data.voices[entity];
+  var content = document.getElementById('content');
+  var actions = data.voices[entity];
   if (!actions) { content.innerHTML = '<p>Entity not found.</p>'; return; }
 
-  const sorted = Object.keys(actions).sort();
-  let html = '<div id="entity-title">' + esc(entity) + '</div>';
+  var filterEl = document.getElementById('clip-filter');
+  var filter = filterEl ? filterEl.value.toLowerCase() : '';
+  var sorted = Object.keys(actions).sort();
+  var html = '<div id="entity-title">' + esc(entity) + '</div>';
 
-  for (const action of sorted) {
-    const clips = actions[action];
+  for (var i = 0; i < sorted.length; i++) {
+    var action = sorted[i];
+    var allClips = actions[action];
+    var clips = filter ? allClips.filter(function(c) {
+      return c.toLowerCase().indexOf(filter) !== -1 || action.toLowerCase().indexOf(filter) !== -1;
+    }) : allClips;
+    if (filter && clips.length === 0) continue;
     html += '<div class="action-group">';
     html += '<div class="action-header">' + esc(action) + ' (' + clips.length + ')</div>';
     html += '<div class="clip-list">';
-    for (const clip of clips) {
-      const ext = clip.split('.').pop().toLowerCase();
-      const mime = ext === 'ogg' ? 'audio/ogg' : 'audio/wav';
+    for (var j = 0; j < clips.length; j++) {
+      var clip = clips[j];
+      var ext = clip.split('.').pop().toLowerCase();
+      var mime = ext === 'ogg' ? 'audio/ogg' : 'audio/wav';
       html += '<div class="clip">' +
         '<span class="name" title="' + esc(clip) + '">' + esc(clip) + '</span>' +
         '<audio controls preload="none" onplay="playClip(this)">' +
@@ -592,10 +595,9 @@ function renderEntity(entity) {
   content.innerHTML = html;
 }
 
-
 function moveClip(fromEntity, fromAction, filename) {
-  const entities = Object.keys(data.voices).sort(entitySort);
-  const root = document.getElementById('modal-root');
+  var entities = Object.keys(data.voices).sort(entitySort);
+  var root = document.getElementById('modal-root');
 
   root.innerHTML = '<div class="modal-bg" onclick="if(event.target===this)closeModal()">' +
     '<div class="modal">' +
@@ -649,6 +651,7 @@ async function doMove(fromEntity, fromAction, filename) {
 
   closeModal();
   data = await (await fetch('/api/mapping')).json();
+  renderTabs();
   renderSidebar();
   updateStats();
   if (currentEntity) renderEntity(currentEntity);
@@ -656,6 +659,7 @@ async function doMove(fromEntity, fromAction, filename) {
 
 async function rescan() {
   data = await (await fetch('/api/rescan')).json();
+  renderTabs();
   renderSidebar();
   updateStats();
   if (currentEntity) renderEntity(currentEntity);
@@ -671,15 +675,20 @@ init();
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print(f"Scanning audio files from {AUDIO_DIR}...")
+    print(f"Building mapping from prefabs in {VOICES_DIR}...")
+    print(f"Audio files in {AUDIO_DIR}")
     mapping_data = load_mapping()
     voices = mapping_data.get("voices", {})
     total = sum(len(clips) for ent in voices.values() for clips in ent.values())
-    print(f"Found {len(voices)} entities, {total} clips")
+    assigned = total - len(voices.get("Uncategorised", {}).get("misc", []))
+    uncat = len(voices.get("Uncategorised", {}).get("misc", []))
+    print(f"Found {len(voices) - (1 if 'Uncategorised' in voices else 0)} voice sets, "
+          f"{assigned} assigned clips, {uncat} uncategorised")
     print(f"\nStarting server at http://localhost:{PORT}")
-    import socketserver
+
     class ReusableHTTPServer(HTTPServer):
         allow_reuse_address = True
+
     server = ReusableHTTPServer(("0.0.0.0", PORT), Handler)
     try:
         server.serve_forever()
