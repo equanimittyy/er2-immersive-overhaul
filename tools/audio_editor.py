@@ -30,6 +30,8 @@ PORT = 8420
 _audio_info_cache = {}  # populated at startup
 _mapping_cache = None
 _refs_cache = None
+# Pre-serialized JSON bytes for large, static responses
+_json_cache = {}  # key -> bytes
 
 
 def load_config():
@@ -505,29 +507,47 @@ def scan_ro2_catalogue():
     return catalogue
 
 
+_ro2_cache = None
+
+
 def load_ro2_catalogue():
+    global _ro2_cache
+    if _ro2_cache is not None:
+        return _ro2_cache
     if RO2_CATALOGUE_FILE.exists():
         with open(RO2_CATALOGUE_FILE) as f:
-            return json.load(f)
+            _ro2_cache = json.load(f)
+            return _ro2_cache
     catalogue = scan_ro2_catalogue()
     if catalogue:
         RO2_CATALOGUE_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(RO2_CATALOGUE_FILE, "w") as f:
             json.dump(catalogue, f, indent=2)
+    _ro2_cache = catalogue
     return catalogue
 
 
+_swaps_cache = None
+
+
 def load_swaps():
+    global _swaps_cache
+    if _swaps_cache is not None:
+        return _swaps_cache
     if SWAPS_FILE.exists():
         with open(SWAPS_FILE) as f:
-            return json.load(f)
-    return {}
+            _swaps_cache = json.load(f)
+    else:
+        _swaps_cache = {}
+    return _swaps_cache
 
 
 def save_swaps(swaps):
+    global _swaps_cache
     SWAPS_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(SWAPS_FILE, "w") as f:
         json.dump(swaps, f, indent=2)
+    _swaps_cache = swaps
 
 
 def _backfill_swap_sources():
@@ -824,11 +844,21 @@ def _apply_gain_wav(filepath, gain):
 
 
 def _convert_to_wav(src, dst):
-    """Convert an audio file to WAV using ffmpeg. Returns True on success."""
+    """Convert an audio file to WAV using ffmpeg.
+
+    Resamples to 48 kHz and converts mono to stereo so that RO2 clips
+    match ER2's native format (48 kHz / stereo / 16-bit PCM).
+    """
     import subprocess
     try:
         subprocess.run(
-            ["ffmpeg", "-y", "-i", str(src), "-acodec", "pcm_s16le", str(dst)],
+            [
+                "ffmpeg", "-y", "-i", str(src),
+                "-ac", "2",              # mono → stereo
+                "-ar", "48000",          # resample to 48 kHz
+                "-acodec", "pcm_s16le",
+                str(dst),
+            ],
             check=True, capture_output=True,
         )
         return True
@@ -1380,17 +1410,17 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/":
             self._send(PAGE_HTML, "text/html")
         elif path == "/api/mapping":
-            self._send_json(_mapping_cache or load_mapping())
+            self._send_json_cached("mapping", _mapping_cache or load_mapping())
         elif path == "/api/refs":
-            self._send_json(_refs_cache or build_refs(load_mapping()))
+            self._send_json_cached("refs", _refs_cache or build_refs(load_mapping()))
         elif path == "/api/swaps":
             self._send_json(load_swaps())
         elif path == "/api/swap-sources":
             self._send_json(load_swap_sources())
         elif path == "/api/audioinfo":
-            self._send_json(_audio_info_cache)
+            self._send_json_cached("audioinfo", _audio_info_cache)
         elif path == "/api/ro2":
-            self._send_json(load_ro2_catalogue())
+            self._send_json_cached("ro2", load_ro2_catalogue())
         elif path == "/api/profiles":
             self._send_json(list_profiles())
         elif path == "/api/config":
@@ -1399,6 +1429,8 @@ class Handler(BaseHTTPRequestHandler):
             _mapping_cache = scan_from_prefabs()
             save_mapping(_mapping_cache)
             _refs_cache = build_refs(_mapping_cache)
+            _json_cache.pop("mapping", None)
+            _json_cache.pop("refs", None)
             self._send_json(_mapping_cache)
         elif path.startswith("/audio/"):
             self._serve_audio(unquote(path[7:]))
@@ -1433,6 +1465,10 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
             self._send_json(self._handle_revert(body))
+        elif path == "/api/swap/bulk-revert":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            self._send_json(self._handle_bulk_revert(body))
         elif path == "/api/swap/bulk-voice":
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
@@ -1568,6 +1604,29 @@ class Handler(BaseHTTPRequestHandler):
 
         return {"ok": True}
 
+    def _handle_bulk_revert(self, body):
+        """Revert multiple swaps at once."""
+        clips = body.get("clips", [])
+        if not clips:
+            return {"ok": False, "error": "No clips provided"}
+
+        swaps = load_swaps()
+        sources = load_swap_sources()
+        reverted = 0
+
+        for original in clips:
+            custom_name = swaps.pop(original, None)
+            sources.pop(original, None)
+            if custom_name:
+                custom_path = CUSTOM_DIR / custom_name
+                if custom_path.exists():
+                    custom_path.unlink()
+                reverted += 1
+
+        save_swaps(swaps)
+        save_swap_sources(sources)
+        return {"ok": True, "reverted": reverted}
+
     def _handle_bulk_voice(self, body):
         """Bulk-assign an RO2 voice actor to an ER2 voice entity."""
         import shutil
@@ -1637,6 +1696,17 @@ class Handler(BaseHTTPRequestHandler):
     def _send_json(self, data):
         self._send(json.dumps(data), "application/json")
 
+    def _send_json_cached(self, key, data):
+        """Serve pre-serialized JSON from cache, or serialize and cache it."""
+        if key not in _json_cache:
+            _json_cache[key] = json.dumps(data).encode()
+        body = _json_cache[key]
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _send(self, content, content_type):
         body = content.encode() if isinstance(content, str) else content
         self.send_response(200)
@@ -1697,6 +1767,18 @@ PAGE_HTML = r"""<!DOCTYPE html>
   #toolbar button.secondary { background: #0f3460; }
   #toolbar button.secondary:hover { background: #1a4a8a; }
   #stats { font-size: 12px; color: #888; }
+  #profile-indicator { font-size: 12px; color: #2ecc71; margin-left: auto; cursor: pointer;
+                       padding: 4px 10px; border-radius: 4px; border: 1px solid #0f3460; }
+  #profile-indicator:hover { background: #0f3460; }
+  #profile-indicator .profile-label { color: #888; }
+
+  .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+           background: #16213e; border: 1px solid #0f3460; color: #e0e0e0;
+           padding: 10px 20px; border-radius: 6px; font-size: 13px; z-index: 200;
+           opacity: 0; transition: opacity 0.3s; pointer-events: none; }
+  .toast.visible { opacity: 1; }
+  .toast.success { border-color: #2ecc71; }
+  .toast.error { border-color: #e94560; }
 
   #content { flex: 1; overflow-y: auto; padding: 20px; }
   #entity-title { font-size: 20px; font-weight: 700; margin-bottom: 16px; color: white; }
@@ -1779,6 +1861,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
            oninput="renderEntity(currentEntity)" style="background:#1a1a2e;border:1px solid #0f3460;
            color:#e0e0e0;padding:6px 10px;border-radius:4px;font-size:12px;width:260px;">
     <span id="stats"></span>
+    <span id="profile-indicator" onclick="showProfiles()"><span class="profile-label">Profile:</span> <span id="profile-name-display">Unsaved</span></span>
   </div>
   <div id="content">
     <p style="padding:40px;color:#888;">Select an entity from the sidebar.</p>
@@ -1786,6 +1869,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
 </div>
 
 <div id="modal-root"></div>
+<div id="toast" class="toast"></div>
 
 <script>
 let data = null;
@@ -1798,11 +1882,41 @@ let ro2Index = [];  // flat searchable list
 let currentEntity = null;
 let currentAudio = null;
 let currentTab = 0;
+let currentProfile = null;
+let profileDirty = false;
 
 var TAB_LABELS = ['Voices', 'Weapons', 'Vehicles', 'Other'];
 
 function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 function escAttr(s) { return s.replace(/\\/g,'\\\\').replace(/'/g,"\\'"); }
+
+var _toastTimer = null;
+function showToast(msg, type) {
+  var el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'toast visible' + (type ? ' ' + type : '');
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(function() { el.className = 'toast'; }, 3000);
+}
+
+function updateProfileIndicator() {
+  var el = document.getElementById('profile-name-display');
+  if (!el) return;
+  if (currentProfile) {
+    el.textContent = currentProfile + (profileDirty ? ' *' : '');
+    el.style.color = profileDirty ? '#e67e22' : '#2ecc71';
+  } else {
+    el.textContent = 'Unsaved';
+    el.style.color = '#888';
+  }
+}
+
+function markProfileDirty() {
+  if (!profileDirty) {
+    profileDirty = true;
+    updateProfileIndicator();
+  }
+}
 
 function entityCategory(name) {
   if (name === 'Uncategorised') return 3;
@@ -2061,12 +2175,11 @@ function scoreRO2(item, entity, action, clip) {
 
 async function reloadAll() {
   var results = await Promise.all([
-    fetch('/api/mapping').then(function(r) { return r.json(); }),
-    fetch('/api/refs').then(function(r) { return r.json(); }),
     fetch('/api/swaps').then(function(r) { return r.json(); }),
     fetch('/api/swap-sources').then(function(r) { return r.json(); }),
   ]);
-  data = results[0]; refs = results[1]; swaps = results[2]; swapSources = results[3];
+  swaps = results[0]; swapSources = results[1];
+  markProfileDirty();
   renderTabs();
   renderSidebar();
   updateStats();
@@ -2154,11 +2267,17 @@ function renderEntity(entity) {
   var filterEl = document.getElementById('clip-filter');
   var filter = filterEl ? filterEl.value.toLowerCase() : '';
   var sorted = Object.keys(actions).sort();
+  var swapCount = entitySwapCount(entity);
   var html = '<div id="entity-title">' + esc(entity);
   if (entityCategory(entity) === 0) {
     html += ' <button onclick="showAssignVoice(\'' + escAttr(entity) + '\')" ' +
       'style="font-size:12px;padding:4px 12px;margin-left:12px;background:#0f3460;border:none;' +
       'color:#e0e0e0;border-radius:4px;cursor:pointer;vertical-align:middle;">Assign RO2 Voice</button>';
+  }
+  if (swapCount > 0) {
+    html += ' <button onclick="revertAllEntity(\'' + escAttr(entity) + '\')" ' +
+      'style="font-size:12px;padding:4px 12px;margin-left:8px;background:#7f1d1d;border:none;' +
+      'color:#fca5a5;border-radius:4px;cursor:pointer;vertical-align:middle;">Remove All Swaps</button>';
   }
   html += '</div>';
 
@@ -2326,14 +2445,27 @@ function previewBulkAssign(entity) {
       }
     }
 
+    // Count how many clips in this action are already swapped
+    var alreadySwapped = 0;
+    if (hasMatch) {
+      for (var sc = 0; sc < Math.min(er2Clips.length, matched); sc++) {
+        if (swaps[er2Clips[sc]]) alreadySwapped++;
+      }
+    }
+    var swapNote = '';
+    if (alreadySwapped > 0) {
+      swapNote = ' <span style="color:#e67e22;font-size:10px;">(' + alreadySwapped + ' already swapped)</span>';
+    }
+
     var checkId = 'bulk-check-' + i;
+    var defaultChecked = hasMatch && alreadySwapped === 0;
     html += '<tr style="' + rowStyle + 'border-bottom:1px solid #0f3460;">' +
-      '<td style="padding:4px 8px;">' + esc(action) + '</td>' +
+      '<td style="padding:4px 8px;">' + esc(action) + swapNote + '</td>' +
       '<td style="padding:4px 8px;">' + er2Clips.length + '</td>' +
       '<td style="padding:4px 8px;">' + (ro2ActionName ? esc(ro2ActionName.split('_').pop()) : '<span style="color:#555;">none</span>') + '</td>' +
       '<td style="padding:4px 8px;">' + (hasMatch ? matched + '/' + ro2Clips.length : '-') + '</td>' +
       '<td style="padding:4px 8px;"><input type="checkbox" id="' + checkId + '" ' +
-      (hasMatch ? 'checked' : 'disabled') + ' data-action="' + escAttr(action) + '"></td></tr>';
+      (hasMatch ? (defaultChecked ? 'checked' : '') : 'disabled') + ' data-action="' + escAttr(action) + '"></td></tr>';
 
     if (hasMatch) {
       for (var m = 0; m < matched; m++) {
@@ -2347,6 +2479,44 @@ function previewBulkAssign(entity) {
     }
   }
   html += '</table>';
+
+  // Warn about already-swapped clips
+  var totalAlreadySwapped = 0;
+  for (var asi = 0; asi < _bulkAssignments.length; asi++) {
+    if (swaps[_bulkAssignments[asi].original]) totalAlreadySwapped++;
+  }
+  if (totalAlreadySwapped > 0) {
+    html += '<div style="margin-top:12px;padding:10px;background:#2c1810;border:1px solid #e67e22;border-radius:4px;">' +
+      '<div style="color:#e67e22;font-weight:bold;margin-bottom:4px;">Existing swaps</div>' +
+      '<div style="font-size:11px;color:#ccc;">' + totalAlreadySwapped + ' clip' + (totalAlreadySwapped > 1 ? 's' : '') +
+      ' already have swaps. These actions are unchecked by default — check them to overwrite.</div></div>';
+  }
+
+  // Warn about clips shared with other entities
+  var affectedOthers = {};
+  for (var ai = 0; ai < _bulkAssignments.length; ai++) {
+    var clipRefs = refs[_bulkAssignments[ai].original] || [];
+    for (var ri = 0; ri < clipRefs.length; ri++) {
+      if (clipRefs[ri].entity !== entity) {
+        if (!affectedOthers[clipRefs[ri].entity]) affectedOthers[clipRefs[ri].entity] = [];
+        affectedOthers[clipRefs[ri].entity].push(_bulkAssignments[ai].original);
+      }
+    }
+  }
+  var affectedNames = Object.keys(affectedOthers);
+  if (affectedNames.length > 0) {
+    html += '<div style="margin-top:12px;padding:10px;background:#2c1810;border:1px solid #e67e22;border-radius:4px;">' +
+      '<div style="color:#e67e22;font-weight:bold;margin-bottom:6px;">Shared clips warning</div>' +
+      '<div style="font-size:11px;color:#ccc;margin-bottom:6px;">Some clips are shared — this assignment will also change audio for:</div>' +
+      '<div style="font-size:11px;max-height:120px;overflow-y:auto;">';
+    for (var oi = 0; oi < affectedNames.length; oi++) {
+      var clipCount = affectedOthers[affectedNames[oi]].length;
+      html += '<div style="padding:2px 0;color:#e67e22;">' + esc(affectedNames[oi]) +
+        ' <span style="color:#888;">(' + clipCount + ' shared clip' + (clipCount > 1 ? 's' : '') + ')</span></div>';
+    }
+    html += '</div></div>';
+  }
+
   preview.innerHTML = html;
   btn.disabled = _bulkAssignments.length === 0;
 }
@@ -2638,6 +2808,136 @@ async function revertSwap(original) {
   await reloadAll();
 }
 
+function revertAllEntity(entity) {
+  var actions = data.voices[entity];
+  if (!actions) return;
+
+  // Collect all swapped clips for this entity
+  var swapped = [];
+  for (var action in actions) {
+    var clips = actions[action];
+    for (var i = 0; i < clips.length; i++) {
+      if (swaps[clips[i]]) swapped.push(clips[i]);
+    }
+  }
+  if (!swapped.length) return;
+
+  // Check which swapped clips are shared with other entities
+  var sharedClips = [];
+  var sharedSet = {};
+  var affectedOthers = {};
+  for (var si = 0; si < swapped.length; si++) {
+    var clipRefs = refs[swapped[si]] || [];
+    for (var ri = 0; ri < clipRefs.length; ri++) {
+      if (clipRefs[ri].entity !== entity) {
+        if (!sharedSet[swapped[si]]) {
+          sharedClips.push(swapped[si]);
+          sharedSet[swapped[si]] = true;
+        }
+        if (!affectedOthers[clipRefs[ri].entity]) affectedOthers[clipRefs[ri].entity] = [];
+        affectedOthers[clipRefs[ri].entity].push(swapped[si]);
+      }
+    }
+  }
+
+  var root = document.getElementById('modal-root');
+  var safeOnly = swapped.length - sharedClips.length;
+  var affectedNames = Object.keys(affectedOthers);
+
+  if (sharedClips.length === 0) {
+    // Simple confirm — no shared clips
+    root.innerHTML = '<div class="modal-bg" onclick="if(event.target===this)closeModal()">' +
+      '<div class="modal">' +
+      '<h3>Remove All Swaps</h3>' +
+      '<p style="margin-bottom:16px;">Revert all <strong>' + swapped.length + '</strong> swapped clip' +
+      (swapped.length > 1 ? 's' : '') + ' for <strong>' + esc(entity) + '</strong> back to their originals?</p>' +
+      '<div class="btn-row">' +
+      '<button class="btn-cancel" onclick="closeModal()">Cancel</button>' +
+      '<button class="btn-ok" onclick="doRevertAllEntity(\'' + escAttr(entity) + '\',false)">Remove All</button>' +
+      '</div></div></div>';
+  } else {
+    // Two-stage: explain shared clips and let user choose
+    var listHtml = '<div style="font-size:11px;max-height:120px;overflow-y:auto;margin:8px 0;">';
+    for (var oi = 0; oi < affectedNames.length; oi++) {
+      var cnt = affectedOthers[affectedNames[oi]].length;
+      listHtml += '<div style="padding:2px 0;color:#e67e22;">' + esc(affectedNames[oi]) +
+        ' <span style="color:#888;">(' + cnt + ' shared clip' + (cnt > 1 ? 's' : '') + ')</span></div>';
+    }
+    listHtml += '</div>';
+
+    root.innerHTML = '<div class="modal-bg" onclick="if(event.target===this)closeModal()">' +
+      '<div class="modal">' +
+      '<h3>Remove All Swaps</h3>' +
+      '<p style="margin-bottom:8px;">This entity has <strong>' + swapped.length + '</strong> swapped clip' +
+      (swapped.length > 1 ? 's' : '') + ', but <strong>' + sharedClips.length + '</strong> of them are shared with other entities:</p>' +
+      '<div style="padding:10px;background:#2c1810;border:1px solid #e67e22;border-radius:4px;margin-bottom:12px;">' +
+      '<div style="color:#e67e22;font-weight:bold;margin-bottom:4px;">Affected entities</div>' +
+      listHtml + '</div>' +
+      (safeOnly > 0
+        ? '<p style="font-size:12px;color:#888;margin-bottom:16px;">You can remove only the <strong>' +
+          safeOnly + '</strong> non-shared swap' + (safeOnly > 1 ? 's' : '') +
+          ', or remove all <strong>' + swapped.length + '</strong> including the shared ones.</p>'
+        : '<p style="font-size:12px;color:#888;margin-bottom:16px;">All swaps on this entity are shared. Removing them will affect the entities above.</p>') +
+      '<div class="btn-row">' +
+      '<button class="btn-cancel" onclick="closeModal()">Cancel</button>' +
+      (safeOnly > 0
+        ? '<button class="btn-ok" style="background:#0f3460;" onclick="doRevertAllEntity(\'' + escAttr(entity) + '\',true)">Remove Non-Shared Only (' + safeOnly + ')</button>'
+        : '') +
+      '<button class="btn-ok" onclick="confirmRevertShared(\'' + escAttr(entity) + '\')">Remove All (' + swapped.length + ')</button>' +
+      '</div></div></div>';
+  }
+}
+
+function confirmRevertShared(entity) {
+  var root = document.getElementById('modal-root');
+  root.innerHTML = '<div class="modal-bg" onclick="if(event.target===this)closeModal()">' +
+    '<div class="modal">' +
+    '<h3 style="color:#e67e22;">Confirm Shared Removal</h3>' +
+    '<p style="margin-bottom:16px;">Are you sure? This will also revert swaps used by other entities. This cannot be undone.</p>' +
+    '<div class="btn-row">' +
+    '<button class="btn-cancel" onclick="closeModal()">Cancel</button>' +
+    '<button class="btn-ok" onclick="doRevertAllEntity(\'' + escAttr(entity) + '\',false)">Yes, Remove All</button>' +
+    '</div></div></div>';
+}
+
+async function doRevertAllEntity(entity, skipShared) {
+  var actions = data.voices[entity];
+  if (!actions) return;
+
+  var clips = [];
+  for (var action in actions) {
+    var actionClips = actions[action];
+    for (var i = 0; i < actionClips.length; i++) {
+      if (!swaps[actionClips[i]]) continue;
+      if (skipShared) {
+        var clipRefs = refs[actionClips[i]] || [];
+        var shared = false;
+        for (var ri = 0; ri < clipRefs.length; ri++) {
+          if (clipRefs[ri].entity !== entity) { shared = true; break; }
+        }
+        if (shared) continue;
+      }
+      clips.push(actionClips[i]);
+    }
+  }
+  if (!clips.length) { closeModal(); return; }
+
+  var root = document.getElementById('modal-root');
+  root.innerHTML = '<div class="modal-bg">' +
+    '<div class="modal" style="text-align:center;padding:40px;">' +
+    '<h3>Reverting...</h3>' +
+    '<p style="color:#888;margin-top:12px;">' + clips.length + ' clips</p>' +
+    '</div></div>';
+
+  await fetch('/api/swap/bulk-revert', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ clips: clips })
+  });
+  closeModal();
+  await reloadAll();
+}
+
 async function showProfiles() {
   var profiles = await (await fetch('/api/profiles')).json();
   var swapCount = Object.keys(swaps).length;
@@ -2648,8 +2948,12 @@ async function showProfiles() {
     listHtml = '<p style="color:#888;padding:8px;">No saved profiles yet.</p>';
   } else {
     for (var i = 0; i < profiles.length; i++) {
-      listHtml += '<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 8px;border-bottom:1px solid #0f3460;">' +
-        '<span style="font-size:13px;">' + esc(profiles[i]) + '</span>' +
+      var isActive = profiles[i] === currentProfile;
+      var rowBg = isActive ? 'background:#0f3460;' : '';
+      listHtml += '<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 8px;border-bottom:1px solid #0f3460;' + rowBg + '">' +
+        '<span style="font-size:13px;">' + esc(profiles[i]) +
+        (isActive ? ' <span style="color:#2ecc71;font-size:10px;margin-left:4px;">ACTIVE</span>' : '') +
+        '</span>' +
         '<div style="display:flex;gap:4px;">' +
         '<button class="btn-ok" style="padding:3px 10px;font-size:11px;" onclick="doLoadProfile(\'' + escAttr(profiles[i]) + '\')">Load</button>' +
         '<button class="btn-cancel" style="padding:3px 10px;font-size:11px;" onclick="doDeleteProfile(\'' + escAttr(profiles[i]) + '\')">Delete</button>' +
@@ -2660,14 +2964,17 @@ async function showProfiles() {
   root.innerHTML = '<div class="modal-bg" onclick="if(event.target===this)closeModal()">' +
     '<div class="modal" style="max-width:500px;">' +
     '<h3>Profiles</h3>' +
-    '<p style="font-size:12px;color:#888;margin-bottom:12px;">Current session: ' + swapCount + ' swaps</p>' +
+    '<p style="font-size:12px;color:#888;margin-bottom:12px;">Current session: ' + swapCount + ' swap' + (swapCount !== 1 ? 's' : '') +
+    (currentProfile ? ' \u00b7 Profile: ' + esc(currentProfile) : ' \u00b7 No profile loaded') + '</p>' +
     '<div style="display:flex;gap:8px;margin-bottom:16px;">' +
     '<input type="text" id="profile-name" placeholder="Profile name..." style="flex:1;">' +
     '<button class="btn-ok" onclick="doSaveProfile()">Save Current</button>' +
     '</div>' +
     '<div style="max-height:300px;overflow-y:auto;">' + listHtml + '</div>' +
-    '<div class="btn-row" style="margin-top:12px;"><button class="btn-cancel" onclick="closeModal()">Close</button></div>' +
-    '</div></div>';
+    '<div class="btn-row" style="margin-top:12px;">' +
+    '<button class="btn-cancel" onclick="closeModal()">Close</button>' +
+    '<button class="btn-ok" style="background:#0f3460;color:#e0e0e0;" onclick="doNewProfile()">New Profile</button>' +
+    '</div></div></div>';
 }
 
 async function doSaveProfile() {
@@ -2678,24 +2985,73 @@ async function doSaveProfile() {
     body: JSON.stringify({name: name})
   });
   var result = await res.json();
-  if (result.ok) showProfiles();
+  if (result.ok) {
+    currentProfile = name;
+    profileDirty = false;
+    updateProfileIndicator();
+    showToast('Profile "' + name + '" saved (' + result.swaps + ' swaps)', 'success');
+    showProfiles();
+  } else {
+    showToast('Failed to save profile', 'error');
+  }
 }
 
 async function doLoadProfile(name) {
-  await fetch('/api/profile/load', {
+  var root = document.getElementById('modal-root');
+  root.innerHTML = '<div class="modal-bg">' +
+    '<div class="modal" style="text-align:center;padding:40px;">' +
+    '<h3>Loading Profile...</h3>' +
+    '<p style="color:#888;margin-top:12px;">' + esc(name) + '</p>' +
+    '</div></div>';
+
+  var res = await fetch('/api/profile/load', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({name: name})
   });
+  var result = await res.json();
   closeModal();
-  await reloadAll();
+  if (result.ok) {
+    currentProfile = name;
+    profileDirty = false;
+    updateProfileIndicator();
+    showToast('Loaded "' + name + '" (' + result.swaps + ' swaps)', 'success');
+  } else {
+    showToast('Failed to load profile', 'error');
+  }
+  // Reload swaps without marking dirty (profile was just loaded)
+  var reloadResults = await Promise.all([
+    fetch('/api/swaps').then(function(r) { return r.json(); }),
+    fetch('/api/swap-sources').then(function(r) { return r.json(); }),
+  ]);
+  swaps = reloadResults[0]; swapSources = reloadResults[1];
+  renderTabs();
+  renderSidebar();
+  updateStats();
+  if (currentEntity) renderEntity(currentEntity);
 }
 
 async function doDeleteProfile(name) {
-  await fetch('/api/profile/delete', {
+  var res = await fetch('/api/profile/delete', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({name: name})
   });
+  var result = await res.json();
+  if (result.ok) {
+    if (currentProfile === name) {
+      currentProfile = null;
+      updateProfileIndicator();
+    }
+    showToast('Profile "' + name + '" deleted', 'success');
+  }
   showProfiles();
+}
+
+function doNewProfile() {
+  currentProfile = null;
+  profileDirty = false;
+  updateProfileIndicator();
+  closeModal();
+  showToast('Started new unsaved profile \u2014 make your changes then save', 'success');
 }
 
 async function showSettings() {
